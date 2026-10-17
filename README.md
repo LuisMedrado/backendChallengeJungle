@@ -1,1 +1,186 @@
-# backendChallengeJungle
+# Wagering Processor
+
+> Serviço que aplica operações de aposta (BET, WIN, LOSS, REFUND, ROLLBACK) nas wallets dos jogadores exatamente uma vez, mesmo com mensagens duplicadas, fora de ordem ou processadas por várias instâncias ao mesmo tempo.
+
+## Visão geral
+
+Provedores de jogos mandam operações ligadas a uma rodada. A entrega é at-least-once: a mesma operação pode chegar mais de uma vez, um REFUND pode chegar antes da BET que ele estorna e várias instâncias podem mexer na mesma wallet ao mesmo tempo. Este serviço recebe essas operações, aplica no saldo e registra tudo num ledger que não pode ser alterado.
+
+O projeto é a resposta ao desafio técnico de backend da Jungle Gaming. O enunciado avalia correção financeira, concorrência, idempotência e recuperação de falhas, então a prioridade foi essa e não volume de endpoints.
+
+A regra que guia o desenho: **o PostgreSQL é a fonte da verdade.** Ordenação e deduplicação da fila ajudam, mas não garantem nada. Unicidade, saldo nunca negativo e imutabilidade do ledger estão em constraints e triggers do banco, não só no código.
+
+As decisões, trade-offs e limitações estão no [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Status
+
+| Parte | Situação |
+|---|---|
+| Ambiente local (Postgres + LocalStack/SQS) | pronto |
+| Domínio (Money, Wallet, ledger, regras de aposta) | pronto, com testes unitários |
+| Schema, migrations e constraints | pronto, com testes de integração |
+| API HTTP e use cases | em desenvolvimento |
+| Consumer SQS, outbox publisher e worker de referências pendentes | a fazer |
+| Logs estruturados e métricas | a fazer |
+
+## Arquitetura
+
+```
+HTTP ─┐                                ┌──────────── uma transação SQL ────────────┐
+      ├─► ProcessWagerTransaction ─────┤ inbox · transação · wallet · ledger · outbox │
+SQS ──┘   (use case único)             └────────────────────────────────────────────┘
+                                                  │                         │
+                                        outbox publisher          worker de PENDING_REFERENCE
+```
+
+O código segue camadas com dependência sempre para dentro:
+
+- **`domain`**: regras de negócio puras, sem NestJS nem ORM. `Money` em centavos (`bigint`), `Wallet` como aggregate root, `WalletLedgerEntry` imutável, `WagerTransaction` com máquina de estados e `WagerSettlement` aplicando as regras de cada tipo de operação.
+- **`application`**: use cases e portas (interfaces de repositório, relógio, gerador de id). Também calcula o `payloadHash` usado na idempotência.
+- **`infrastructure`**: implementação das portas com MikroORM e SQL.
+- **`interfaces`**: controllers HTTP (e, depois, o consumer SQS).
+
+A concorrência é controlada por wallet: cada operação trava a linha da wallet (`SELECT ... FOR UPDATE`) antes de mexer no saldo. Operações da mesma wallet entram em fila, wallets diferentes rodam em paralelo.
+
+## Primeiros passos
+
+### Pré-requisitos
+
+- [Bun](https://bun.sh) 1.x (desenvolvido com 1.4.3)
+- Docker com Docker Compose (no Windows, Docker Desktop com WSL2)
+
+O Node não é necessário: o Bun roda o TypeScript direto e também é o gerenciador de pacotes e o test runner.
+
+### Instalação
+
+```bash
+bun install
+```
+```bash
+cp .env.example .env
+```
+```bash
+bun run infra:up
+```
+```bash
+bun run db:migrate
+```
+
+O `infra:up` sobe Postgres 17 e LocalStack 4.4 e só termina quando os dois estão saudáveis: o banco aceitando conexão e as filas SQS criadas. O banco `wagering_test`, usado pelos testes de integração, é criado na primeira subida do volume.
+
+### Configuração
+
+Tudo vem do `.env` (copiado do `.env.example`):
+
+| Variável | Pra que serve |
+|---|---|
+| `PORT` | porta da API (padrão 3000) |
+| `DATABASE_URL` | banco de desenvolvimento |
+| `DATABASE_URL_TEST` | banco dos testes de integração |
+| `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | acesso ao SQS do LocalStack (credenciais `test`/`test`) |
+| `SQS_QUEUE_URL`, `SQS_DLQ_URL` | fila principal e DLQ |
+
+As portas do Postgres (5432) e do LocalStack (4566) ficam publicadas só em `127.0.0.1`.
+
+## Uso
+
+```bash
+bun run dev
+```
+
+Sobe a API com reload automático. Para conferir se está no ar:
+
+```bash
+curl http://localhost:3000/health/live
+```
+
+Outros comandos:
+
+| Comando | O que faz |
+|---|---|
+| `bun run start` | sobe a API sem watch |
+| `bun run db:migrate` | aplica as migrations pendentes |
+| `bun run db:rollback` | desfaz a última migration (`bun scripts/migrate.ts down --all` desfaz todas) |
+| `bun run infra:logs` | acompanha os logs dos containers |
+| `bun run infra:down` | derruba os containers e apaga os volumes |
+
+## Estrutura do projeto
+
+```
+├── docker/
+│   ├── localstack/init-sqs.sh   # cria a DLQ e a fila FIFO com redrive (maxReceiveCount 5)
+│   └── postgres/init.sql        # cria o banco de testes
+├── migrations/                  # migrations com up e down, em SQL escrito à mão
+├── scripts/migrate.ts           # aplica ou desfaz migrations
+├── src/
+│   ├── domain/                  # regras de negócio puras
+│   ├── application/             # use cases, portas e payloadHash
+│   ├── infrastructure/          # MikroORM e persistência
+│   ├── interfaces/http/         # controllers e configuração HTTP
+│   ├── app.module.ts
+│   └── main.ts
+├── test/
+│   ├── unit/                    # domínio, sem banco nem fila
+│   └── integration/             # Postgres real em container
+└── docker-compose.yml
+```
+
+## Componentes principais
+
+### Money (`src/domain/money/money.ts`)
+
+Guarda o valor em centavos num `bigint`, então não existe erro de ponto flutuante. Na entrada exige string com exatamente duas casas (`"25.00"`) e recusa notação científica, `NaN`, `Infinity`, sinal e mais de duas casas. É imutável: toda operação devolve uma instância nova, e misturar moedas lança erro.
+
+### Wallet e ledger (`src/domain/wallet`, `src/domain/ledger`)
+
+O saldo só muda por `debit` e `credit`, e os dois devolvem o lançamento do ledger correspondente. O lançamento confere a própria conta (`saldo antes ± valor = saldo depois`) antes de a wallet mudar, e se a conta não fecha nada é alterado. Por isso os dois nunca discordam.
+
+### Regras de aposta (`src/domain/wagering`)
+
+`WagerSettlement` aplica as regras de cada tipo:
+
+- **BET** debita, e sem saldo é rejeitada com `INSUFFICIENT_FUNDS`.
+- **WIN** credita.
+- **LOSS** registra o resultado sem mexer no saldo.
+- **REFUND** e **ROLLBACK** revertem uma operação anterior.
+
+Se a operação referenciada ainda não chegou, a transação fica `PENDING_REFERENCE` e é tentada de novo com backoff exponencial. A lista completa de códigos de falha está no ARCHITECTURE.md.
+
+### Schema (`migrations/`)
+
+A migration inicial cria wallets, transações, ledger, inbox e outbox. Alguns exemplos do que o banco garante sozinho:
+
+- uma wallet por jogador e moeda;
+- saldo nunca negativo;
+- idempotency key única;
+- referência sempre da mesma wallet, via FK composta;
+- uma reversão processada por tipo de operação;
+- ledger append-only (trigger bloqueia `UPDATE`, `DELETE` e `TRUNCATE`).
+
+## Desenvolvimento
+
+### Testes
+
+```bash
+bun test
+```
+```bash
+bun run test:unit
+```
+```bash
+bun run test:integration
+```
+
+Os testes de integração usam Postgres de verdade, então precisam do `bun run infra:up` antes. Cada arquivo começa recriando o schema (migration down e depois up) no banco `wagering_test`.
+
+Desde a fase do schema, o teste vem antes do código. Escreve, vê falhar, só depois implementa.
+
+Os testes de schema tentam quebrar cada garantia direto por SQL e conferem o código de erro e o nome da constraint violada. Assim um teste não passa por causa de outra regra.
+
+### Checagem de tipos
+
+```bash
+bun run typecheck
+```
+
+O TypeScript roda em modo estrito, com `noUncheckedIndexedAccess` e `verbatimModuleSyntax` ligados.
