@@ -1,0 +1,42 @@
+name: wagering
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # pra criar banco de testew, roda so 1 vez
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    # tentei com latest e nao deu por causa das credenciais
+    # deixei nessa ver mesmo, que ta funcionando sem
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "4566:4566"
+    volumes:
+      # volume pros scripts de inicializacao
+      - ./docker/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      # so sobe com healthy dps de criar a fila principal
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-transactions.fifo >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  pgdata:
