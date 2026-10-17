@@ -6,10 +6,12 @@
 2. [Stack](#2-stack-e-ambiente-local)
 3. [Mensageria](#3-mensageria-sqs)
 4. [Modelo de domínio](#4-modelo-de-domínio)
-5. [Códigos de falha](#5-códigos-de-falha)
-6. [Interpretações das regras](#6-interpretações-das-regras)
-7. [Limitações](#7-limitações-conhecidas)
-8. [O que eu faria com mais tempo](#8-o-que-eu-faria-com-mais-tempo)
+5. [Persistência e schema](#5-persistência-e-schema)
+6. [Códigos de falha](#6-códigos-de-falha)
+7. [Interpretações das regras](#7-interpretações-das-regras)
+8. [Testes](#8-testes)
+9. [Limitações](#9-limitações-conhecidas)
+10. [O que eu faria com mais tempo](#10-o-que-eu-faria-com-mais-tempo)
 
 ---
 
@@ -30,7 +32,7 @@ as garantias de unicidade, imutabilidade e não negatividade ficam em constraint
 | Runtime / pacotes / testes | Bun 1.x | Exigido no projeto, executa TypeScript e carrega as deps. |
 | Framework | NestJS 11 | Exigido no projeto, DI e hooks (como o `enableShutdownHooks`) usados no shutdown. |
 | Banco | PostgreSQL 17 | Exigido no projeto, Versão estável atual. |
-| Mensageria | LocalStack 4.4 (SQS) | Exigido (LocalStack ou MiniStack). Tem limitações, descritas na seção 7. |
+| Mensageria | LocalStack 4.4 (SQS) | Exigido (LocalStack ou MiniStack). Tem limitações, descritas na seção 9. |
 | Orquestração | Docker Compose | Exigido no projeto. |
 
 ### Decisões
@@ -144,7 +146,70 @@ na outbox é o `eventId`, então uma publicação duplicada chega com o mesmo id
 
 ---
 
-## 5. Códigos de falha
+## 5. Persistência e schema
+
+### ORM e migrations
+
+- **MikroORM** (o preferencial do enunciado). Unit of Work, `em.transactional()` e `LockMode` explícitos combinam
+  com o que o processamento precisa: travar a wallet, aplicar tudo e commitar junto.
+- As migrations são **SQL escrito à mão** dentro das classes de migration do MikroORM, cada uma com `up` e `down`.
+  O schema é parte do que é avaliado, então prefiro controlar cada constraint em vez de deixar o ORM gerar.
+- A lista de migrations é explícita (`migrations/index.ts`) em vez de glob no disco. Funciona igual no Bun e no Node.
+- Rodam em transação e com `allOrNothing`: se uma falhar, nada fica aplicado pela metade.
+- `bun run db:migrate` aplica e `bun run db:rollback` volta a última. O teste de integração faz up → down → up pra
+  provar que é reversível.
+
+### Dinheiro no banco
+
+`NUMERIC(19,2)` pro valor e `CHAR(3)` pra moeda, em colunas separadas. O pg devolve `NUMERIC` como string
+(`"975.00"`), que entra direto no `Money.from`, sem passar por float em nenhum momento.
+
+### Garantias no schema
+
+| Garantia | Como |
+|---|---|
+| Uma wallet por player + moeda | `UNIQUE (player_id, currency)` |
+| Saldo nunca negativo | `CHECK (balance >= 0)` na wallet e `balance_before/after >= 0` no ledger |
+| Idempotência | `UNIQUE (idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)` |
+| Referência na msm wallet | FK composta `(reference_transaction_id, wallet_id) → (id, wallet_id)` |
+| Uma reversão por tipo | índice único parcial `(reference_transaction_id, kind) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK')` |
+| Um OPENING por wallet | índice único parcial `(wallet_id) WHERE kind = 'OPENING'` |
+| Regras por kind | `CHECK`s: REFUND/ROLLBACK exigem referência, BET não aceita, valor zero só em LOSS |
+| Coerência do status | `CHECK`s: `failure_code` só em REJECTED/FAILED, PROCESSED exige `processed_at` e `balance_after`, PENDING_REFERENCE exige `next_reference_check_at` |
+| Um lançamento por transação | `UNIQUE (transaction_id, wallet_id)` no ledger |
+| Lançamento na msm wallet e moeda | FKs compostas pra `wager_transactions (id, wallet_id)` e `wallets (id, currency)` |
+| Aritmética do lançamento | `CHECK (balance_after = balance_before ± amount)` |
+| Ledger imutável | trigger bloqueia `UPDATE`, `DELETE` e `TRUNCATE` |
+| Transação imutável | trigger: terminal não muda nada, campos que vieram do provedor nunca mudam, e não pode apagar |
+| Dedup da inbox | `PRIMARY KEY (consumer_name, message_id)` |
+
+Os triggers usam `ERRCODE = 'restrict_violation'` (23001), então a aplicação diferencia "violou imutabilidade" de
+"violou check" (23514) e de "duplicou" (23505).
+
+`balance_after` da transação fica na moeda da **wallet**, não da transação. Uma transação rejeitada por
+`CURRENCY_MISMATCH` (operação em USD numa wallet BRL) guarda o saldo BRL que a wallet tinha.
+
+### Índices
+
+Só pras queries que já sei que vão existir. Conferi com `EXPLAIN` que o planner usa cada um:
+
+| Índice | Query que atende |
+|---|---|
+| `outbox_pending_ix (sequence) WHERE published_at IS NULL` | publisher buscando eventos pendentes em ordem. Parcial, só guarda o que falta publicar |
+| `wager_tx_pending_reference_due_ix (next_reference_check_at) WHERE status = 'PENDING_REFERENCE'` | worker buscando as que venceram o backoff |
+| `wager_tx_waiting_for_reference_ix (provider_id, reference_external_transaction_id) WHERE status = 'PENDING_REFERENCE'` | quando uma transação chega, achar quem tava esperando por ela |
+| `ledger_wallet_sequence_ix (wallet_id, sequence)` | paginação do ledger por cursor e reconciliação |
+
+O ledger e a outbox têm uma coluna `sequence` (`GENERATED ALWAYS AS IDENTITY`). É a ordem de inserção e serve de
+cursor estável, sem depender de relógio nem de empate de `created_at`.
+
+Os índices são criados sem `CONCURRENTLY`, pq na migration inicial as tabelas estão vazias e a migration roda em
+transação (que não aceita `CONCURRENTLY`). Numa tabela já populada em produção seria uma migration separada, fora de
+transação.
+
+---
+
+## 6. Códigos de falha
 
 Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o resultado original;
 "corrigir" significa enviar uma nova transação.
@@ -165,7 +230,7 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 
 ---
 
-## 6. Interpretações das regras
+## 7. Interpretações das regras
 
 | Regra / ambiguidade | Interpretação adotada |
 |---|---|
@@ -176,16 +241,54 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 | Valor zero | Só `LOSS` aceita `"0.00"`. Os demais kinds exigem valor positivo. |
 | `playerId` diferente do dono da wallet | `REJECTED` com `WALLET_PLAYER_MISMATCH` (persistido e auditável). |
 | Wallet aberta com saldo zero | Não gera transação `OPENING` nem lançamento. |
+| Formato de `playerId` e `walletId` | UUID, como nos exemplos do enunciado (coluna `uuid` no banco). `providerId`, `externalTransactionId`, `roundId` e `gameId` são texto livre. |
 
 ---
 
-## 7. Limitações conhecidas
+## 8. Testes
+
+### Teste antes do código
+
+A partir da Fase 2 os testes são escritos **antes** da implementação. O fluxo é escrever o teste, rodar e ver falhar,
+e só depois implementar até passar. Assim o teste descreve o comportamento esperado e não vira um espelho do código que
+já existe (teste feito pra passar).
+
+A Fase 1 (domínio) foi feita com o código primeiro e os testes logo depois. Mesmo assim, um deles pegou um bug real:
+reaplicar uma transação já decidida debitava a wallet de novo antes de falhar.
+
+### Camadas
+
+| Tipo | Onde | O que usa |
+|---|---|---|
+| Unidade | `test/unit` | Só o domínio, sem banco nem fila. Roda em milissegundos. |
+| Integração | `test/integration` | PostgreSQL e LocalStack reais em container, sem mock (o enunciado elimina quem mocka os dois). |
+
+Os testes de integração usam o banco `wagering_test`, separado do de desenvolvimento. Cada arquivo começa com
+migration down → up, então parte de um schema limpo. Não dá pra limpar com `TRUNCATE` pq o ledger bloqueia, e isso é
+proposital.
+
+Os testes de schema (`test/integration/schema.test.ts`) tentam violar cada garantia direto via SQL e conferem o código
+de erro **e o nome da constraint**. Assim um teste não passa por acidente por causa de outra regra.
+
+---
+
+## 9. Limitações conhecidas
 
 ### Reversão por tipo
 
 Seguindo o enunciado, a unicidade da reversão é por `(referência, tipo)`. Uma `BET` que recebe `REFUND` e depois
 `ROLLBACK` direto (e não um `ROLLBACK` do `REFUND`) é creditada duas vezes. Com mais contexto do domínio, eu avaliaria
 restringir a uma reversão por referência, independentemente do tipo.
+
+### Banco
+
+- `NUMERIC(19,2)` arredonda em silêncio um valor com mais casas (`1.005` vira `1.01`) antes de qualquer `CHECK`.
+  O banco não tem como recusar isso, então a validação de escala fica no `Money.from`, na entrada.
+- A coerência entre `wallets.balance` e a soma do ledger não é uma constraint (exigiria somar o ledger a cada escrita).
+  Ela é garantida pela aplicação, que grava saldo e lançamento na msm transação, e conferida pelo endpoint de
+  reconciliação.
+- Em dev o app conecta com o usuário dono das tabelas. Em produção, um role de aplicação sem `UPDATE`/`DELETE` no
+  ledger seria uma segunda barreira além do trigger.
 
 ### LocalStack
 
@@ -202,6 +305,6 @@ restringir a uma reversão por referência, independentemente do tipo.
 
 ---
 
-## 8. O que eu faria com mais tempo
+## 10. O que eu faria com mais tempo
 
 - _[quando terminar preciso lembrar de preencher]_

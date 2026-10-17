@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { MoneyProps } from '../../domain/money/money';
 
-// campos de negócio que entram no hash. header Idempotency-Key e metadados de transporte
-// (messageId, type, occurredAt) ficam de fora, aí a msm operação por HTTP ou SQS gera o msm hash
+// campos de negócio que entram no hash ficam de fora, aí a mesma operação por HTTP ou SQS gera o msm hash
 export interface WagerPayloadFields {
   providerId: string;
   externalTransactionId: string;
@@ -15,8 +14,7 @@ export interface WagerPayloadFields {
   referenceExternalTransactionId?: string;
 }
 
-// SHA-256 (hex) do JSON canônico dos campos acima
-// JSON canônico = chaves ordenadas recursivamente, sem espaços e sem campos undefined
+// SHA-256 do JSON dos campos acima
 // referência vazia conta como ausente
 export function computePayloadHash(fields: WagerPayloadFields): string {
   const subset: WagerPayloadFields = {
