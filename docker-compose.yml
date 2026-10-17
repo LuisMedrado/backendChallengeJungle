@@ -8,10 +8,10 @@ services:
       POSTGRES_PASSWORD: wagering
       POSTGRES_DB: wagering
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # pra criar banco de testew, roda so 1 vez
+      # pra criar banco de testes, roda so 1 vez
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
@@ -27,7 +27,7 @@ services:
       SERVICES: sqs
       AWS_DEFAULT_REGION: us-east-1
     ports:
-      - "4566:4566"
+      - "127.0.0.1:4566:4566"
     volumes:
       # volume pros scripts de inicializacao
       - ./docker/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro

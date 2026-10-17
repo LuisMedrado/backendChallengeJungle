@@ -12,6 +12,7 @@
     "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
     "useUnknownInCatchVariables": true,
+    "verbatimModuleSyntax": true,
 
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,

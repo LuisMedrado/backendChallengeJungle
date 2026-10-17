@@ -1,3 +1,4 @@
 # sem lf quebram no container
+* text=auto eol=lf
 *.sh text eol=lf
 *.sql text eol=lf

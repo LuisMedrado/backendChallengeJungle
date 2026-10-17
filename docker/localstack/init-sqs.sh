@@ -12,7 +12,7 @@ DLQ_ARN=$(awslocal sqs get-queue-attributes \
   --query 'Attributes.QueueArn' --output text)
 
 # fila principal
-# 30 seg pra processar antes daa mensagem reaparecer
+# 30 seg pra processar antes da mensagem reaparecer
 # setar maxreceivecount em 5, dps vai pra dlq
 awslocal sqs create-queue \
   --queue-name wager-transactions.fifo \

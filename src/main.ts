@@ -12,4 +12,8 @@ async function bootstrap(): Promise<void> {
   console.log(`wagering-processor ouvindo na porta ${port}`);
 }
 
-void bootstrap();
+// falha no boot encerra com código != 0 em vez de ficar solto
+bootstrap().catch((error: unknown) => {
+  console.error('falha ao iniciar wagering-processor', error);
+  process.exit(1);
+});
