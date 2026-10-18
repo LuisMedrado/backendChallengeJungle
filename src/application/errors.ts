@@ -62,6 +62,11 @@ export class TransientInfrastructureError extends ApplicationError {
   readonly code = 'SERVICE_UNAVAILABLE';
 }
 
+/** broker recusou ou não respondeu a publicação, o evento fica pra nova tentativa */
+export class EventPublishError extends ApplicationError {
+  readonly code = 'EVENT_PUBLISH_FAILED';
+}
+
 /** update da wallet não achou a version esperada, alguém mexeu no meio */
 export class ConcurrentModificationError extends ApplicationError {
   readonly code = 'CONCURRENT_MODIFICATION';

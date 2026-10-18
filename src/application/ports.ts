@@ -49,6 +49,15 @@ export interface LedgerRepository {
 
 export interface OutboxRepository {
   add(messages: OutboxMessage[]): Promise<void>;
+  /** pega os pendentes vencidos e trava as linhas, pulando as que outra instância já travou */
+  claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
+  /** grava tentativas, próxima tentativa e publicação */
+  save(message: OutboxMessage): Promise<void>;
+}
+
+export interface EventPublisher {
+  /** lança EventPublishError quando o broker falha, qualquer outro erro é tratado como falha do processo */
+  publish(message: OutboxMessage): Promise<void>;
 }
 
 export interface TransactionScope {

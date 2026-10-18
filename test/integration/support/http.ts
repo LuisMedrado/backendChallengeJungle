@@ -18,10 +18,13 @@ export interface TestApp {
 }
 
 // sobe a api de verdade numa porta aleatória apontando pro banco de teste
-export async function startTestApp(): Promise<TestApp> {
+// o publisher da outbox fica desligado por padrão pra não mexer na fila nos testes que não são dele
+export async function startTestApp(options: { outboxPublisher?: boolean } = {}): Promise<TestApp> {
   process.env.DATABASE_URL = testDatabaseUrl();
   // timeout curto pro teste de lock não demorar
   process.env.DB_LOCK_TIMEOUT_MS = '300';
+  process.env.OUTBOX_PUBLISHER_ENABLED = options.outboxPublisher ? 'true' : 'false';
+  process.env.OUTBOX_POLL_INTERVAL_MS = '50';
   const app = await NestFactory.create(AppModule, { logger: false });
   configureHttpApp(app);
   await app.listen(0, '127.0.0.1');
