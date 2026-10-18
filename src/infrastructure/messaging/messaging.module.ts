@@ -7,10 +7,10 @@ import {
   type OnModuleDestroy,
 } from '@nestjs/common';
 import type { SQSClient } from '@aws-sdk/client-sqs';
-import type { Clock, EventPublisher, UnitOfWork } from '../../application/ports';
+import type { Clock, EventPublisher, Metrics, UnitOfWork } from '../../application/ports';
 import { PublishOutboxBatch } from '../../application/use-cases/publish-outbox-batch';
 import { booleanEnv, positiveIntEnv, requireEnv } from '../config';
-import { CLOCK, EVENT_PUBLISHER, OUTBOX_WORKER, SQS_CLIENT, UNIT_OF_WORK } from '../tokens';
+import { CLOCK, EVENT_PUBLISHER, METRICS, OUTBOX_WORKER, SQS_CLIENT, UNIT_OF_WORK } from '../tokens';
 import { OutboxPublisherWorker } from '../workers/outbox-publisher.worker';
 import { createSqsClient } from './sqs-client';
 import { SqsEventPublisher } from './sqs-event-publisher';
@@ -29,9 +29,9 @@ const DEFAULT_BATCH_SIZE = 50;
     },
     {
       provide: PublishOutboxBatch,
-      useFactory: (uow: UnitOfWork, publisher: EventPublisher, clock: Clock) =>
-        new PublishOutboxBatch(uow, publisher, clock, positiveIntEnv('OUTBOX_BATCH_SIZE', DEFAULT_BATCH_SIZE)),
-      inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK],
+      useFactory: (uow: UnitOfWork, publisher: EventPublisher, clock: Clock, metrics: Metrics) =>
+        new PublishOutboxBatch(uow, publisher, clock, positiveIntEnv('OUTBOX_BATCH_SIZE', DEFAULT_BATCH_SIZE), metrics),
+      inject: [UNIT_OF_WORK, EVENT_PUBLISHER, CLOCK, METRICS],
     },
     {
       provide: OUTBOX_WORKER,

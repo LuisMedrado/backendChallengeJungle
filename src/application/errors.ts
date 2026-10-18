@@ -58,8 +58,18 @@ export class DuplicateKeyError extends ApplicationError {
 }
 
 /** banco fora, deadlock, timeout... vale tentar de novo depois */
+export type TransientReason = 'lock_timeout' | 'deadlock' | 'serialization' | 'unavailable';
+
 export class TransientInfrastructureError extends ApplicationError {
   readonly code = 'SERVICE_UNAVAILABLE';
+
+  /** motivo, pra métrica separar disputa de concorrência de banco fora do ar */
+  constructor(
+    message: string,
+    readonly reason: TransientReason = 'unavailable',
+  ) {
+    super(message);
+  }
 }
 
 /** broker recusou ou não respondeu a publicação, o evento fica pra nova tentativa */

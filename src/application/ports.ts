@@ -74,6 +74,33 @@ export interface EventPublisher {
   publish(message: OutboxMessage): Promise<void>;
 }
 
+export type Channel = 'http' | 'sqs' | 'worker';
+export type DuplicateType = 'idempotent_replay' | 'inbox_message';
+export type RetrySource = 'sqs_consumer' | 'outbox' | 'pending_reference';
+export type LockConflictType = 'lock_timeout' | 'deadlock' | 'version_mismatch' | 'idempotency_race';
+
+/** fatos operacionais que a aplicação avisa, quem implementa decide como medir */
+export interface Metrics {
+  transactionDecided(channel: Channel, kind: string, status: string): void;
+  duplicateDetected(type: DuplicateType): void;
+  retryScheduled(source: RetrySource): void;
+  deadLettered(reason: string): void;
+  lockConflict(type: LockConflictType): void;
+  processingObserved(channel: Channel, outcome: string, seconds: number): void;
+  reconciliationDivergence(): void;
+}
+
+// pra quem monta os use cases sem métrica, tipo os testes de integração
+export const NOOP_METRICS: Metrics = {
+  transactionDecided: () => {},
+  duplicateDetected: () => {},
+  retryScheduled: () => {},
+  deadLettered: () => {},
+  lockConflict: () => {},
+  processingObserved: () => {},
+  reconciliationDivergence: () => {},
+};
+
 export interface TransactionScope {
   wallets: WalletRepository;
   transactions: WagerTransactionRepository;
