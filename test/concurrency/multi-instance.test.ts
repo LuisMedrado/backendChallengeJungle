@@ -11,7 +11,16 @@ import {
   sendToQueue,
   wagerQueueUrl,
 } from '../integration/support/sqs';
-import { Cluster, freePorts, type Instance, killInstance, request, startInstance, waitFor } from './support/instances';
+import {
+  Cluster,
+  freePorts,
+  type Instance,
+  killInstance,
+  request,
+  startCluster,
+  startInstance,
+  waitFor,
+} from './support/instances';
 
 // três processos de verdade da aplicação, cada um com seu pool de conexões, consumer e workers
 const INSTANCES = 3;
@@ -26,7 +35,7 @@ beforeAll(async () => {
   db = await connect();
   sqs = createSqsClient();
   for (const url of [wagerQueueUrl(), deadLetterQueueUrl(), eventsQueueUrl()]) await purgeQueue(sqs, url);
-  cluster = new Cluster(await Promise.all((await freePorts(INSTANCES)).map((port) => startInstance(port))));
+  cluster = new Cluster(await startCluster(await freePorts(INSTANCES)));
 }, 60_000);
 
 afterAll(async () => {
