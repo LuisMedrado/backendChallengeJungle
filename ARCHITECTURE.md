@@ -552,6 +552,9 @@ Problemas reais que apareceram durante o desenvolvimento, e como foram resolvido
 |---|---|---|
 | Unidade | `test/unit` | Só o domínio, sem banco nem fila. Roda em milissegundos. |
 | Integração | `test/integration` | PostgreSQL e LocalStack reais em container, sem mock (o enunciado elimina quem mocka os dois). |
+| Concorrência | `test/concurrency` | Três processos de verdade da aplicação, `bun src/main.ts` em portas diferentes, contra o msm banco e as msmas filas. |
+
+`bun run test:unit` dá feedback em milissegundos. A suíte inteira, com os três processos, leva perto de 2 min.
 
 Os testes de integração usam o banco `wagering_test`, separado do de desenvolvimento. Cada arquivo começa com
 migration down → up, então parte de um schema limpo. Não dá pra limpar com `TRUNCATE` pq o ledger bloqueia, e isso é
@@ -559,6 +562,48 @@ proposital.
 
 Os testes de schema (`test/integration/schema.test.ts`) tentam violar cada garantia direto via SQL e conferem o código
 de erro **e o nome da constraint**. Assim um teste não passa por acidente por causa de outra regra.
+
+### Invariante final em todas as suítes
+
+O enunciado pede que todo teste termine com `wallet.balance == saldo reconstruído pelo ledger`. Cada suíte de
+integração e a de concorrência terminam com um teste que confere isso pra **todas** as wallets do banco, não só as que o
+teste usou. Ficam de fora só duas suítes que quebram o invariante de propósito: a de schema, que insere linhas cruas
+pra testar constraint, e a de wallets, que corrompe um saldo pra provar que a reconciliação detecta.
+
+### Paralelismo real e várias instâncias
+
+Os testes de concorrência disparam as requisições juntas com `Promise.all`, nunca em sequência. A suíte
+`test/concurrency` sobe três processos da aplicação, cada um com seu pool de conexões, consumer, publisher da outbox e
+worker de referências, e um cliente que distribui as requisições entre eles em rodízio. Esse cliente age como um
+provedor de verdade: se a instância cai ou responde 503, reenvia pra próxima com a msm `Idempotency-Key`.
+
+### Cobertura da seção 13 do enunciado
+
+| Cenário pedido | Onde está |
+|---|---|
+| A msm aposta 50 vezes em paralelo vira um débito só | `wagering.e2e`, e 60 vezes espalhada entre 3 processos em `multi-instance` |
+| Operações disputando o saldo da msm wallet, o cenário 100 / 80 / 80 | `wagering.e2e`, e 30 apostas pra um saldo que só dá pra 10 entre 3 processos |
+| Wallets distintas em paralelo | `wagering.e2e`: com a wallet A travada, a B responde em menos de 250ms. Prova que não tem lock global |
+| Três ou mais processos simultâneos | `multi-instance`, HTTP e fila |
+| Worker morto depois do commit e antes do ack | `sqs-consumer` simulando, e `multi-instance` matando processo de verdade |
+| Dois publishers na msm outbox | `outbox-publisher`, com pools separados |
+| `ROLLBACK` ou `REFUND` antes da referência | `pending-reference` e `pending-reference.e2e` |
+| Reinício com prova de consistência final | `multi-instance`: mata uma instância no meio da carga, sobe de novo e confere tudo |
+
+**O teste de reinício.** São 10 wallets com 200 apostas, metade por HTTP e metade pela fila. Quando 40 já foram
+processadas, o teste mata uma das instâncias com `SIGKILL`, sem dar chance de terminar nada, e sobe ela de novo. Aí
+espera o sistema estabilizar: fila de entrada vazia, inclusive as mensagens que estavam em voo na instância morta e
+só voltam depois do visibility timeout de 30s, e outbox toda publicada. No fim confere:
+
+- cada wallet com exatamente 20 débitos e o saldo certo;
+- nenhuma mensagem na DLQ;
+- invariante saldo == ledger em todas as wallets;
+- **pelo menos uma requisição precisou de failover.** Sem isso o teste poderia passar só pq a instância morreu num
+  momento ocioso, e não teria provado nada.
+
+**Fase 7 e TDD.** Os testes desta fase são de caracterização: verificam garantias que as fases anteriores já deviam
+dar, e nasceram verdes. Não teve vermelho pra mostrar, e isso é registrado aqui de propósito. Pra ter certeza de que
+o teste de reinício não passava por acaso, ele ganhou a checagem de failover.
 
 ---
 
@@ -615,6 +660,16 @@ O lock por wallet serializa as operações dela, então o throughput de **uma** 
 transação. É a troca consciente por correção: wallets diferentes continuam em paralelo. Sob contenção forte numa
 wallet só, parte das requisições passa do `lock_timeout` e recebe 503, e o provedor reenvia com a msm key sem risco
 de duplicar.
+
+### Testes de concorrência
+
+- As três instâncias da suíte `test/concurrency` usam portas fixas, 3101 a 3103. Se alguma estiver ocupada na máquina,
+  a suíte não sobe.
+- No Windows não tem `SIGTERM` de verdade entre processos: qualquer `kill` encerra na hora. Por isso o desligamento
+  gracioso é testado dentro do processo, chamando o `stop()` do consumer e dos workers, e o teste multi-processo cobre o
+  outro lado, a morte abrupta.
+- O teste de reinício espera o visibility timeout de 30s da fila pra mensagem em voo na instância morta voltar. É o
+  comportamento real, mas deixa a suíte mais lenta.
 
 ### LocalStack
 

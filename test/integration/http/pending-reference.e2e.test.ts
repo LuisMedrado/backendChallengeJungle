@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { migrate } from '../support/database';
+import { connect, migrate, walletsOutOfBalance } from '../support/database';
 import { startTestApp, type TestApp } from '../support/http';
 
 let api: TestApp;
@@ -59,4 +59,15 @@ describe('worker de referências pendentes dentro da aplicação', () => {
     expect((await api.get(`/wallets/${wallet.body.id}`)).body.balance).toEqual({ amount: '100.00', currency: 'BRL' });
     expect((await api.post(`/wallets/${wallet.body.id}/reconciliation`)).body.consistent).toBe(true);
   }, 15_000);
+});
+
+describe('invariante final', () => {
+  it('toda wallet do banco tem saldo igual ao reconstruído pelo ledger', async () => {
+    const client = await connect();
+    try {
+      expect(await walletsOutOfBalance(client)).toEqual([]);
+    } finally {
+      await client.end();
+    }
+  });
 });

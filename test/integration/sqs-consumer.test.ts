@@ -14,7 +14,7 @@ import {
   SqsWagerConsumer,
 } from '../../src/interfaces/sqs/sqs-wager-consumer';
 import { WagerMessageHandler } from '../../src/interfaces/sqs/wager-message.handler';
-import { connect, migrate, testDatabaseUrl } from './support/database';
+import { connect, migrate, testDatabaseUrl, walletsOutOfBalance } from './support/database';
 import { deadLetterQueueUrl, purgeQueue, receiveAll, sendToQueue, wagerQueueUrl } from './support/sqs';
 
 const CONSUMER_NAME = 'wager-transactions-consumer';
@@ -359,4 +359,15 @@ describe('SqsWagerConsumer', () => {
     const back = await receiveAll(sqs, wagerQueueUrl());
     expect(back).toHaveLength(2);
   }, 15_000);
+});
+
+describe('invariante final', () => {
+  it('toda wallet do banco tem saldo igual ao reconstruído pelo ledger', async () => {
+    const client = await connect();
+    try {
+      expect(await walletsOutOfBalance(client)).toEqual([]);
+    } finally {
+      await client.end();
+    }
+  });
 });

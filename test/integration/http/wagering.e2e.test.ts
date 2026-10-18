@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import type { Client } from 'pg';
-import { connect, migrate } from '../support/database';
+import { connect, migrate, walletsOutOfBalance } from '../support/database';
 import { startTestApp, type TestApp } from '../support/http';
 
 let api: TestApp;
@@ -263,6 +263,40 @@ describe('POST /wagering/transactions', () => {
       await assertLedgerConsistent(wallet);
     });
 
+    it('wallets distintas não esperam uma pela outra: não existe lock global', async () => {
+      const blocked = await createWallet('100.00');
+      const free = await createWallet('100.00');
+
+      // a wallet A fica travada por outra conexão o teste todo
+      const locker = await connect();
+      await locker.query('BEGIN');
+      await locker.query('SELECT 1 FROM wallets WHERE id = $1 FOR UPDATE', [blocked.id]);
+      try {
+        const started = Date.now();
+        const res = await submit(wager(free));
+        expect(res.status).toBe(200);
+        // bem abaixo do lock timeout: a B não ficou na fila da A
+        expect(Date.now() - started).toBeLessThan(250);
+      } finally {
+        await locker.query('ROLLBACK');
+        await locker.end();
+      }
+    });
+
+    it('várias wallets apostando em paralelo terminam cada uma com o saldo certo', async () => {
+      const wallets = await Promise.all(Array.from({ length: 10 }, () => createWallet('50.00')));
+      // 10 wallets x 5 apostas de 10.00, tudo disparado junto
+      const results = await Promise.all(
+        wallets.flatMap((wallet) => Array.from({ length: 5 }, () => submit(wager(wallet, { money: brl('10.00') })))),
+      );
+
+      expect(results.every((r) => r.status === 200)).toBe(true);
+      for (const wallet of wallets) {
+        expect(await balanceOf(wallet)).toBe('0.00');
+        expect(await debitsOf(wallet)).toBe(5);
+      }
+    });
+
     it('wallet travada por tempo demais devolve 503 em vez de prender a conexão', async () => {
       const wallet = await createWallet('100.00');
       const body = wager(wallet);
@@ -328,5 +362,16 @@ describe('consultas de transação', () => {
   it('transação inexistente é 404', async () => {
     expect((await api.get(`/wagering/transactions/${crypto.randomUUID()}`)).status).toBe(404);
     expect((await api.get(`/providers/provider-a/wagering/transactions/nao-existe`)).status).toBe(404);
+  });
+});
+
+describe('invariante final', () => {
+  it('toda wallet do banco tem saldo igual ao reconstruído pelo ledger', async () => {
+    const client = await connect();
+    try {
+      expect(await walletsOutOfBalance(client)).toEqual([]);
+    } finally {
+      await client.end();
+    }
   });
 });

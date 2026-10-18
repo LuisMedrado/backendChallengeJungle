@@ -26,6 +26,20 @@ export async function connect(): Promise<Client> {
   return client;
 }
 
+// invariante final do enunciado: saldo da wallet == saldo reconstruído pelo ledger, pra todas as wallets do banco.
+// devolve as que não batem, lista vazia é o esperado
+export async function walletsOutOfBalance(db: Client): Promise<{ id: string; balance: string; ledger: string }[]> {
+  const { rows } = await db.query<{ id: string; balance: string; ledger: string }>(
+    `SELECT w.id, w.balance::text AS balance,
+            COALESCE(SUM(CASE l.direction WHEN 'CREDIT' THEN l.amount ELSE -l.amount END), 0)::numeric(19,2)::text AS ledger
+       FROM wallets w
+       LEFT JOIN wallet_ledger_entries l ON l.wallet_id = w.id
+      GROUP BY w.id, w.balance
+     HAVING w.balance <> COALESCE(SUM(CASE l.direction WHEN 'CREDIT' THEN l.amount ELSE -l.amount END), 0)`,
+  );
+  return rows;
+}
+
 // colunas vem dos próprios testes, valores vão sempre como parâmetro
 export async function insert(db: Client, table: string, row: Record<string, unknown>): Promise<void> {
   const columns = Object.keys(row);

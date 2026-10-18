@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 import type { Client } from 'pg';
 import { createSqsClient } from '../../../src/infrastructure/messaging/sqs-client';
-import { connect, migrate } from '../support/database';
+import { connect, migrate, walletsOutOfBalance } from '../support/database';
 import { startTestApp, type TestApp } from '../support/http';
 import { deadLetterQueueUrl, purgeQueue, sendToQueue, wagerQueueUrl } from '../support/sqs';
 
@@ -73,5 +73,16 @@ describe('consumer dentro da aplicação', () => {
     await api.close();
     // long polling é cortado no stop, não espera os segundos do receive
     expect(Date.now() - started).toBeLessThan(3_000);
+  });
+});
+
+describe('invariante final', () => {
+  it('toda wallet do banco tem saldo igual ao reconstruído pelo ledger', async () => {
+    const client = await connect();
+    try {
+      expect(await walletsOutOfBalance(client)).toEqual([]);
+    } finally {
+      await client.end();
+    }
   });
 });
