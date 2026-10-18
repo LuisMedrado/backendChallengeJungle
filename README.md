@@ -23,6 +23,7 @@ As decisões, trade-offs e limitações estão no [ARCHITECTURE.md](ARCHITECTURE
 | Outbox publisher | pronto, com testes de integração (publishers concorrentes e crash antes do commit) |
 | Consumer SQS com inbox, retry e DLQ | pronto, com testes de integração (redelivery, crash antes do ack, SIGTERM) |
 | Worker de referências pendentes | pronto, com testes de integração (backoff, limite de tentativas, workers concorrentes) |
+| Testes com três processos simultâneos e reinício | pronto |
 | Logs estruturados e métricas | a fazer |
 
 ## Arquitetura
@@ -155,7 +156,8 @@ Outros comandos:
 │   └── main.ts
 ├── test/
 │   ├── unit/                    # domínio, sem banco nem fila
-│   └── integration/             # Postgres real em container
+│   ├── integration/             # Postgres e SQS reais em container
+│   └── concurrency/             # três processos da aplicação ao msm tempo
 └── docker-compose.yml
 ```
 
@@ -204,8 +206,15 @@ bun run test:unit
 ```bash
 bun run test:integration
 ```
+```bash
+bun run test:concurrency
+```
 
-Os testes de integração usam Postgres de verdade, então precisam do `bun run infra:up` antes. Cada arquivo começa recriando o schema (migration down e depois up) no banco `wagering_test`.
+Os testes de integração e de concorrência usam Postgres e SQS de verdade, então precisam do `bun run infra:up` antes. Cada arquivo começa recriando o schema (migration down e depois up) no banco `wagering_test`.
+
+O `test:concurrency` sobe três processos da aplicação nas portas 3101 a 3103 e testa os três ao mesmo tempo: disputa de saldo, a mesma aposta enviada dezenas de vezes, três consumers na mesma fila e uma instância morta no meio da carga e reiniciada. A suíte inteira leva perto de 2 minutos. Para feedback rápido, use `test:unit`.
+
+Toda suíte que mexe em saldo termina conferindo que o saldo de **todas** as wallets do banco bate com o ledger.
 
 Desde a fase do schema, o teste vem antes do código. Escreve, vê falhar, só depois implementa.
 

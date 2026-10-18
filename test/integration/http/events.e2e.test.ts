@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 import { createSqsClient } from '../../../src/infrastructure/messaging/sqs-client';
-import { migrate } from '../support/database';
+import { connect, migrate, walletsOutOfBalance } from '../support/database';
 import { startTestApp, type TestApp } from '../support/http';
 import { eventsQueueUrl, purgeQueue, receiveAll } from '../support/sqs';
 
@@ -61,5 +61,16 @@ describe('eventos de ponta a ponta', () => {
     const res = await api.get('/health/ready');
     expect(res.status).toBe(200);
     expect(res.body.checks).toEqual({ postgres: 'up', sqs: 'up' });
+  });
+});
+
+describe('invariante final', () => {
+  it('toda wallet do banco tem saldo igual ao reconstruído pelo ledger', async () => {
+    const client = await connect();
+    try {
+      expect(await walletsOutOfBalance(client)).toEqual([]);
+    } finally {
+      await client.end();
+    }
   });
 });

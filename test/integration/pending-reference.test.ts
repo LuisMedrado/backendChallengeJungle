@@ -13,7 +13,7 @@ import { WagerTransactionStatus } from '../../src/domain/wagering/wager-transact
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { PostgresUnitOfWork } from '../../src/infrastructure/persistence/postgres-unit-of-work';
 import { UuidV7Generator } from '../../src/infrastructure/system';
-import { connect, migrate, testDatabaseUrl } from './support/database';
+import { connect, migrate, testDatabaseUrl, walletsOutOfBalance } from './support/database';
 
 // relógio controlado pelo teste, pra andar o backoff sem esperar de verdade
 class TestClock implements Clock {
@@ -291,5 +291,16 @@ describe('ResolvePendingReferences', () => {
     for (const id of refundIds) expect((await transactionRow(id)).status).toBe('PROCESSED');
     expect(await balanceOf(wallet.id)).toBe('100.00');
     expect(await ledgerIsConsistent(wallet.id)).toBe(true);
+  });
+});
+
+describe('invariante final', () => {
+  it('toda wallet do banco tem saldo igual ao reconstruído pelo ledger', async () => {
+    const client = await connect();
+    try {
+      expect(await walletsOutOfBalance(client)).toEqual([]);
+    } finally {
+      await client.end();
+    }
   });
 });
