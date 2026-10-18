@@ -10,6 +10,7 @@
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
     "test:concurrency": "bun test test/concurrency",
+    "test:load": "bun test/load/run.ts",
     "typecheck": "tsc --noEmit",
     "db:migrate": "bun scripts/migrate.ts up",
     "db:rollback": "bun scripts/migrate.ts down",

@@ -241,6 +241,14 @@ Os testes de integração e de concorrência usam Postgres e SQS de verdade, ent
 
 O `test:concurrency` sobe três processos da aplicação em portas livres escolhidas na hora e testa os três ao mesmo tempo: disputa de saldo, a mesma aposta enviada dezenas de vezes, três consumers na mesma fila e uma instância morta no meio da carga e reiniciada. A suíte inteira leva perto de 2 minutos. Para feedback rápido, use `test:unit`.
 
+### Teste de carga
+
+```bash
+bun run test:load
+```
+
+Sobe três instâncias e mede três cenários: carga espalhada em várias wallets, tudo numa wallet só e mensagens pela fila. Zera o `wagering_test`, então não roda junto com a suíte. O resultado e a análise estão no [LOAD_TEST.md](LOAD_TEST.md).
+
 Toda suíte que mexe em saldo termina conferindo que o saldo de **todas** as wallets do banco bate com o ledger.
 
 Desde a fase do schema, o teste vem antes do código. Escreve, vê falhar, só depois implementa.

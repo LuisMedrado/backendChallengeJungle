@@ -458,6 +458,12 @@ O de reinício: 10 wallets, 200 apostas, metade HTTP e metade fila. Com 40 proce
 ela de novo. Espera fila vazia, inclusive o que tava em voo e só volta depois de 30s, e outbox publicada. No fim:
 20 débitos e saldo certo por wallet, DLQ vazia, `balance == ledger` e pelo menos um failover.
 
+### Carga
+
+`bun run test:load` mede três cenários com 3 instâncias. A metodologia, os números e a análise estão no
+[LOAD_TEST.md](LOAD_TEST.md). O achado principal: a correção não cede, mas a outbox publica uns 460 eventos/s e não
+acompanha os ~1.800/s gerados quando a carga se espalha por várias wallets.
+
 ---
 
 ## 12. Limitações conhecidas
