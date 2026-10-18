@@ -365,6 +365,52 @@ Um use case só, `ProcessWagerTransaction`, atende o HTTP e a fila. Tudo dentro 
 - Isolamento `READ COMMITTED` (padrão do Postgres). Depois de pegar o lock, cada SELECT enxerga o que a transação
   anterior da msm wallet commitou, então a checagem de idempotência e a busca da referência veem o estado atual.
 
+### Referências fora de ordem
+
+Quando um `REFUND`, `ROLLBACK` ou `WIN` com referência chega antes da transação que ele referencia, ele é gravado como
+`PENDING_REFERENCE` e responde 202. Quem resolve depois é o `PendingReferenceWorker`, que roda o use case
+`ResolvePendingReferences` em loop.
+
+**Um ciclo do worker:**
+
+1. Busca os ids `PENDING_REFERENCE` com `next_reference_check_at` vencido, os mais atrasados primeiro, pelo índice
+   parcial `wager_tx_pending_reference_due_ix`.
+2. Pra cada um, abre uma transação SQL própria: trava a **wallet** com `FOR UPDATE` e só depois relê a transação
+   pendente. É a msm ordem de lock do HTTP e da fila, wallet primeiro, então não tem deadlock entre eles.
+3. Se a transação não está mais pendente ou o backoff ainda não venceu, pula. É o que acontece quando dois workers
+   pegam o msm id: o segundo espera o lock da wallet, relê, vê que já foi resolvida e segue.
+4. Busca a referência e decide:
+   - chegou e já foi decidida: o `WagerSettlement` do domínio aplica a operação, igual na entrada direta. Pode virar
+     `PROCESSED` ou `REJECTED` por alguma regra, tipo valor diferente ou referência rejeitada;
+   - não chegou e ainda tem tentativa: conta mais uma e agenda a próxima com backoff (2s, 4s, 8s... até 5 min);
+   - não chegou e esgotou as 10 tentativas: `REJECTED` com `REFERENCE_NOT_FOUND`.
+5. Grava tudo e, se a transação terminou, os eventos na outbox, na msm transação.
+
+Uma transação com problema num ciclo não trava as outras: o erro é registrado no log, ela continua vencida e volta no
+próximo ciclo.
+
+**Eventos.** O `WagerTransactionPendingReference` sai só na primeira vez, quando a transação fica pendente. As novas
+tentativas só atualizam a linha, senão uma referência que nunca chega geraria 10 eventos iguais. Quando a transação
+termina, sai o evento final: `WagerTransactionProcessed` com `WalletBalanceChanged`, ou `WagerTransactionRejected`.
+
+**Acordar quem está esperando.** Quando qualquer transação termina decidida, um `UPDATE` pelo índice parcial
+`wager_tx_waiting_for_reference_ix` antecipa pra agora o `next_reference_check_at` de quem estava esperando por ela.
+Sem isso, um `REFUND` na sexta tentativa esperaria até 64s mesmo com a `BET` já tendo chegado. Isso roda tanto na
+entrada direta quanto no próprio worker, pq uma transação resolvida pelo worker também pode ser referência de outra,
+tipo um `ROLLBACK` de um `REFUND`.
+
+**Replay.** Reenviar a msm operação depois que ela foi resolvida devolve o estado atual dela, não o 202 do primeiro
+envio: a transação deixou de estar pendente.
+
+| Variável | Padrão | Pra que serve |
+|---|---|---|
+| `PENDING_REFERENCE_WORKER_ENABLED` | `true` | liga o worker na instância |
+| `PENDING_REFERENCE_POLL_INTERVAL_MS` | `1000` | espera entre ciclos quando não tem nada vencido |
+| `PENDING_REFERENCE_BATCH_SIZE` | `50` | transações por ciclo |
+
+O loop do worker é o msm `PollingWorker` da outbox: se o ciclo fez trabalho emenda o próximo, se não fez espera o
+intervalo, e o `stop()` espera o ciclo atual terminar antes do pool do banco fechar.
+
 ### Corrida de idempotência
 
 Duas requisições com a msm key mas `walletId` diferentes travam wallets diferentes, então as duas passam pela checagem
@@ -434,7 +480,8 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 |---|---|
 | Quais kinds aceitam referência | `REFUND` e `ROLLBACK` exigem. `WIN` e `LOSS` aceitam opcionalmente (só `BET`). `BET` com referência é payload inválido. |
 | "Não pode ser revertida duas vezes **pelo mesmo tipo**" | Seguida literalmente (regra 4 da seção 7 do enunciado): uma referência aceita no máximo um `REFUND` e no máximo um `ROLLBACK`. Consequência: uma `BET` com `REFUND` e também `ROLLBACK` é creditada duas vezes. Ver limitações. |
-| Referência existe mas ainda não foi decidida (ex.: está `PENDING_REFERENCE`) | Tratada como ausente: a transação fica `PENDING_REFERENCE` e tenta de novo. |
+| Referência existe mas ainda não foi decidida (ex.: está `PENDING_REFERENCE`) | Tratada como ausente: a transação fica `PENDING_REFERENCE` e tenta de novo. Se esgotar as tentativas assim, vira `REJECTED` com `REFERENCE_NOT_FOUND`, msm código de quando a referência nunca chega. |
+| Limite de tentativas da referência | 10 tentativas com backoff de 2s até 5 min, uns 18 min no total. Provedor costuma mandar a operação referenciada em segundos, e o dinheiro da reversão fica "parado" enquanto espera, então não compensa esperar muito mais. O worker acorda quem espera assim que a referência chega, então o limite só pesa quando ela não vem mesmo. |
 | Referência existe e terminou `REJECTED`/`FAILED` | `REJECTED` com `REFERENCE_NOT_PROCESSED`, sem esperar. |
 | Valor zero | Só `LOSS` aceita `"0.00"`. Os demais kinds exigem valor positivo. |
 | `playerId` diferente do dono da wallet | `REJECTED` com `WALLET_PLAYER_MISMATCH` (persistido e auditável). |
@@ -488,6 +535,16 @@ Problemas reais que apareceram durante o desenvolvimento, e como foram resolvido
   ficava pendurada até o teste estourar o tempo (5s).
 - **Correção:** `SET LOCAL lock_timeout` no começo de cada transação (padrão 5s, `DB_LOCK_TIMEOUT_MS`). Quem passa do
   tempo recebe 503 com `Retry-After`, nada é gravado, e reenviar com a msm key processa normal depois.
+
+**4. Índice criado e nunca usado (Fase 6, revisão do schema)**
+
+- **Como apareceu:** na revisão de banco do worker de referências. O índice `wager_tx_waiting_for_reference_ix`, criado
+  na Fase 2 pra "achar quem estava esperando por uma transação", não era usado por nenhuma query.
+- **O problema por trás:** sem usar esse índice, uma transação pendente só era reavaliada quando o backoff dela
+  vencia, mesmo com a referência já tendo chegado. Na sexta tentativa isso dava até 64s de espera à toa.
+- **Correção:** quando uma transação termina decidida, quem esperava por ela é acordado na hora por um `UPDATE` que
+  usa o índice. Teste escrito antes: empurra o backoff pra longe, manda a referência e espera o worker resolver sem o
+  relógio andar.
 
 ### Camadas
 

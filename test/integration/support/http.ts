@@ -19,7 +19,11 @@ export interface TestApp {
 
 // sobe a api de verdade numa porta aleatória apontando pro banco de teste
 // o publisher da outbox fica desligado por padrão pra não mexer na fila nos testes que não são dele
-export async function startTestApp(options: { outboxPublisher?: boolean; sqsConsumer?: boolean } = {}): Promise<TestApp> {
+export async function startTestApp(
+  options: { outboxPublisher?: boolean; sqsConsumer?: boolean; pendingReferenceWorker?: boolean } = {},
+): Promise<TestApp> {
+  process.env.PENDING_REFERENCE_WORKER_ENABLED = options.pendingReferenceWorker ? 'true' : 'false';
+  process.env.PENDING_REFERENCE_POLL_INTERVAL_MS = '50';
   process.env.DATABASE_URL = testDatabaseUrl();
   // timeout curto pro teste de lock não demorar
   process.env.DB_LOCK_TIMEOUT_MS = '300';
