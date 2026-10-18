@@ -1,9 +1,11 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { configureHttpApp } from './interfaces/http/configure-http-app';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule);
+  configureHttpApp(app);
   // preciso disso pro shutdown correto com sigterm do consumer sqs
   app.enableShutdownHooks();
 
