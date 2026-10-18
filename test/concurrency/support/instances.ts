@@ -1,4 +1,5 @@
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { Subprocess } from 'bun';
 import { testDatabaseUrl } from '../../integration/support/database';
 
@@ -34,10 +35,16 @@ export async function freePort(): Promise<number> {
   return port!;
 }
 
+export interface StartOptions {
+  readyTimeoutMs?: number;
+}
+
 // sobe um processo da aplicação de verdade, com http, consumer e os dois workers ligados
 // sem porta, pega uma livre. o restart passa a porta da instância morta pra subir no msm lugar
-export async function startInstance(port?: number): Promise<Instance> {
+// a saída do processo vai pra um arquivo, pra dar pra ver pq uma instância não subiu
+export async function startInstance(port?: number, options: StartOptions = {}): Promise<Instance> {
   port ??= await freePort();
+  const logBase = join(tmpdir(), `wagering-instance-${port}-${Date.now()}`);
   const child = Bun.spawn([process.execPath, 'src/main.ts'], {
     cwd: PROJECT_ROOT,
     env: {
@@ -51,16 +58,34 @@ export async function startInstance(port?: number): Promise<Instance> {
       PENDING_REFERENCE_WORKER_ENABLED: 'true',
       PENDING_REFERENCE_POLL_INTERVAL_MS: '100',
     },
-    stdout: 'ignore',
-    stderr: 'ignore',
+    stdout: Bun.file(`${logBase}.log`),
+    stderr: Bun.file(`${logBase}.err.log`),
   });
   const instance = { port, baseUrl: `http://127.0.0.1:${port}`, process: child };
-  await waitUntilReady(instance);
+  try {
+    await waitUntilReady(instance, options.readyTimeoutMs ?? 30_000);
+  } catch (error) {
+    // não pode sobrar processo vivo, senão ele segue consumindo fila e banco dos próximos testes
+    await killInstance(instance);
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`${reason}. saída em ${logBase}.log e ${logBase}.err.log\n${await tail(`${logBase}.err.log`)}`);
+  }
   return instance;
 }
 
-async function waitUntilReady(instance: Instance): Promise<void> {
-  const deadline = Date.now() + 30_000;
+// sobe todas ou nenhuma: se uma falha, derruba as que já subiram
+export async function startCluster(ports: number[], options: StartOptions = {}): Promise<Instance[]> {
+  const results = await Promise.allSettled(ports.map((port) => startInstance(port, options)));
+  const failure = results.find((result) => result.status === 'rejected');
+  if (!failure) return results.map((result) => (result as PromiseFulfilledResult<Instance>).value);
+
+  const started = results.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []));
+  await Promise.all(started.map((instance) => killInstance(instance)));
+  throw failure.reason;
+}
+
+async function waitUntilReady(instance: Instance, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (instance.process.exitCode !== null) throw new Error(`instância ${instance.port} morreu no boot`);
     try {
@@ -71,7 +96,15 @@ async function waitUntilReady(instance: Instance): Promise<void> {
     }
     await Bun.sleep(200);
   }
-  throw new Error(`instância ${instance.port} não ficou pronta`);
+  throw new Error(`instância ${instance.port} não ficou pronta em ${timeoutMs}ms`);
+}
+
+async function tail(path: string, lines = 20): Promise<string> {
+  try {
+    return (await Bun.file(path).text()).trimEnd().split('\n').slice(-lines).join('\n');
+  } catch {
+    return '';
+  }
 }
 
 // mata sem dar chance de terminar nada, como um crash ou um kill -9
