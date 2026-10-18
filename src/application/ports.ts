@@ -1,4 +1,5 @@
 import type { WalletLedgerEntry } from '../domain/ledger/wallet-ledger-entry';
+import type { InboxMessage } from '../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../domain/messaging/outbox-message';
 import type { Money } from '../domain/money/money';
 import type { WagerTransaction, WagerTransactionKind } from '../domain/wagering/wager-transaction';
@@ -55,6 +56,13 @@ export interface OutboxRepository {
   save(message: OutboxMessage): Promise<void>;
 }
 
+export type InboxRegistration = { registered: true } | { registered: false; payloadHash: string };
+
+export interface InboxRepository {
+  /** registra a mensagem como processada, se já existir não grava nada e devolve o hash do registro original */
+  register(message: InboxMessage): Promise<InboxRegistration>;
+}
+
 export interface EventPublisher {
   /** lança EventPublishError quando o broker falha, qualquer outro erro é tratado como falha do processo */
   publish(message: OutboxMessage): Promise<void>;
@@ -65,6 +73,7 @@ export interface TransactionScope {
   transactions: WagerTransactionRepository;
   ledger: LedgerRepository;
   outbox: OutboxRepository;
+  inbox: InboxRepository;
 }
 
 export interface UnitOfWork {

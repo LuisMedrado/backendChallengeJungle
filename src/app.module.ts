@@ -1,4 +1,5 @@
-import { Logger, Module } from '@nestjs/common';
+import { Inject, Logger, Module, type OnApplicationBootstrap, type OnModuleDestroy } from '@nestjs/common';
+import type { SQSClient } from '@aws-sdk/client-sqs';
 import type { Clock, IdGenerator, UnitOfWork } from './application/ports';
 import { CreateWallet } from './application/use-cases/create-wallet';
 import { ProcessWagerTransaction } from './application/use-cases/process-wager-transaction';
@@ -9,18 +10,24 @@ import {
   ReconcileWallet,
   type ReconciliationReport,
 } from './application/use-cases/queries';
+import { booleanEnv, positiveIntEnv, requireEnv } from './infrastructure/config';
 import { PersistenceModule } from './infrastructure/persistence/persistence.module';
 import { MessagingModule } from './infrastructure/messaging/messaging.module';
 import { SystemModule } from './infrastructure/system.module';
-import { CLOCK, ID_GENERATOR, UNIT_OF_WORK } from './infrastructure/tokens';
+import { CLOCK, ID_GENERATOR, SQS_CLIENT, SQS_CONSUMER, UNIT_OF_WORK } from './infrastructure/tokens';
 import { HealthController } from './interfaces/http/health.controller';
 import { WageringController } from './interfaces/http/wagering.controller';
 import { WalletsController } from './interfaces/http/wallets.controller';
+import { SqsWagerConsumer } from './interfaces/sqs/sqs-wager-consumer';
+import { WagerMessageHandler } from './interfaces/sqs/wager-message.handler';
 
 // use cases são classes puras, sem decorator do nest, então entram por factory
 const writeDeps = [UNIT_OF_WORK, CLOCK, ID_GENERATOR];
 
 const reconciliationLogger = new Logger('Reconciliation');
+
+// nome do consumer na inbox, se um dia tiver outro consumer da msm fila ele usa outro nome
+const WAGER_CONSUMER_NAME = 'wager-transactions-consumer';
 
 @Module({
   imports: [SystemModule, PersistenceModule, MessagingModule],
@@ -51,6 +58,32 @@ const reconciliationLogger = new Logger('Reconciliation');
         }),
       inject: [UNIT_OF_WORK],
     },
+    {
+      provide: SQS_CONSUMER,
+      useFactory: (sqs: SQSClient, processWager: ProcessWagerTransaction) =>
+        new SqsWagerConsumer(sqs, new WagerMessageHandler(processWager, WAGER_CONSUMER_NAME), {
+          queueUrl: requireEnv('SQS_QUEUE_URL'),
+          deadLetterQueueUrl: requireEnv('SQS_DLQ_URL'),
+          waitTimeSeconds: positiveIntEnv('SQS_WAIT_TIME_SECONDS', 20),
+          maxMessages: 10,
+          retryBaseDelaySeconds: positiveIntEnv('SQS_RETRY_BASE_DELAY_SECONDS', 1),
+          retryMaxDelaySeconds: positiveIntEnv('SQS_RETRY_MAX_DELAY_SECONDS', 60),
+        }),
+      inject: [SQS_CLIENT, ProcessWagerTransaction],
+    },
   ],
 })
-export class AppModule {}
+export class AppModule implements OnApplicationBootstrap, OnModuleDestroy {
+  constructor(@Inject(SQS_CONSUMER) private readonly consumer: SqsWagerConsumer) {}
+
+  // toda instância consome, o lock por wallet e a inbox seguram a concorrência entre elas
+  onApplicationBootstrap(): void {
+    if (booleanEnv('SQS_CONSUMER_ENABLED', true)) this.consumer.start();
+  }
+
+  // no SIGTERM o nest chama isso antes de fechar o pool do banco:
+  // para de receber, termina a mensagem em andamento e devolve as outras pra fila
+  async onModuleDestroy(): Promise<void> {
+    await this.consumer.stop();
+  }
+}
