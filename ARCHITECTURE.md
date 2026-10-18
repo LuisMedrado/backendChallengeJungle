@@ -8,11 +8,13 @@
 4. [Modelo de domínio](#4-modelo-de-domínio)
 5. [Persistência e schema](#5-persistência-e-schema)
 6. [Processamento e API](#6-processamento-e-api)
-7. [Códigos de falha](#7-códigos-de-falha)
-8. [Interpretações das regras](#8-interpretações-das-regras)
-9. [Testes](#9-testes)
-10. [Limitações](#10-limitações-conhecidas)
-11. [O que eu faria com mais tempo](#11-o-que-eu-faria-com-mais-tempo)
+7. [Observabilidade](#7-observabilidade)
+8. [Autenticação](#8-autenticação)
+9. [Códigos de falha](#9-códigos-de-falha)
+10. [Interpretações das regras](#10-interpretações-das-regras)
+11. [Testes](#11-testes)
+12. [Limitações](#12-limitações-conhecidas)
+13. [O que eu faria com mais tempo](#13-o-que-eu-faria-com-mais-tempo)
 
 ---
 
@@ -33,7 +35,7 @@ as garantias de unicidade, imutabilidade e não negatividade ficam em constraint
 | Runtime / pacotes / testes | Bun 1.x | Exigido no projeto, executa TypeScript e carrega as deps. |
 | Framework | NestJS 11 | Exigido no projeto, DI e hooks (como o `enableShutdownHooks`) usados no shutdown. |
 | Banco | PostgreSQL 17 | Exigido no projeto, Versão estável atual. |
-| Mensageria | LocalStack 4.4 (SQS) | Exigido (LocalStack ou MiniStack). Tem limitações, descritas na seção 10. |
+| Mensageria | LocalStack 4.4 (SQS) | Exigido (LocalStack ou MiniStack). Tem limitações, descritas na seção 12. |
 | Orquestração | Docker Compose | Exigido no projeto. |
 
 ### Decisões
@@ -61,7 +63,7 @@ as garantias de unicidade, imutabilidade e não negatividade ficam em constraint
 ## 3. Mensageria (SQS)
 
 As duas primeiras filas têm os nomes definidos no enunciado. A terceira é a saída dos eventos, que o enunciado não
-nomeia (ver seção 8):
+nomeia (ver seção 10):
 
 | Fila | Configuração |
 |---|---|
@@ -279,7 +281,7 @@ na outbox é o `eventId`, então uma publicação duplicada chega com o mesmo id
   violação de unique virando decisão de negócio, e o join pra trazer a moeda da wallet. O domínio já tem classes
   ricas com `create`/`rehydrate`, então uma camada de entidade do ORM no meio seria mais um mapeamento sem ganho.
   O custo é não usar o Identity Map nem o `LockMode` do ORM, e escrever o mapeamento linha → domínio à mão.
-- O driver do MikroORM devolve `timestamptz` como string, não como `Date`. Os mapeamentos convertem explícito (ver achado 2 na seção 9).
+- O driver do MikroORM devolve `timestamptz` como string, não como `Date`. Os mapeamentos convertem explícito (ver achado 2 na seção 11).
 - As migrations são **SQL escrito à mão** dentro das classes de migration do MikroORM, cada uma com `up` e `down`.
   O schema é parte do que é avaliado, então prefiro controlar cada constraint em vez de deixar o ORM gerar.
 - A lista de migrations é explícita (`migrations/index.ts`) em vez de glob no disco. Funciona igual no Bun e no Node.
@@ -359,7 +361,7 @@ Um use case só, `ProcessWagerTransaction`, atende o HTTP e a fila. Tudo dentro 
 - Escolhi pessimista e não otimista pq numa hot wallet (muita aposta na msm wallet) o otimista gera retry em cascata.
   Com o lock cada operação espera a vez uma vez só. Como cada transação trava uma wallet só, não tem como dar deadlock.
 - O `UPDATE` do saldo ainda confere a `version` como segunda barreira. Se não bater, nada é gravado e a resposta é 503.
-- **`lock_timeout` por transação** (achado 3 na seção 9). `SET LOCAL lock_timeout`, padrão 5s, `DB_LOCK_TIMEOUT_MS`. Quem espera o lock
+- **`lock_timeout` por transação** (achado 3 na seção 11). `SET LOCAL lock_timeout`, padrão 5s, `DB_LOCK_TIMEOUT_MS`. Quem espera o lock
   segura uma conexão do pool. Sem limite, uma wallet travada prenderia todas as conexões e derrubaria as outras
   wallets junto. Com o limite, quem passa do tempo recebe 503 com `Retry-After` e nada é gravado.
 - Isolamento `READ COMMITTED` (padrão do Postgres). Depois de pegar o lock, cada SELECT enxerga o que a transação
@@ -453,7 +455,90 @@ só que como `REJECTED`. Por isso o corpo é o msm de uma processada, com o `fai
 
 ---
 
-## 7. Códigos de falha
+## 7. Observabilidade
+
+### Logs
+
+Toda a aplicação loga pelo `JsonLogger`, que substitui o logger do Nest desde o boot: **uma linha JSON por entrada**,
+com `time`, `level` e `context`. Mensagem passada como objeto vira campo estruturado, então dá pra filtrar por id em
+qualquer agregador de log sem regex.
+
+| De onde | Campos de identificação |
+|---|---|
+| Cada requisição HTTP, quando termina | `correlationId`, `method`, `path`, `status`, `durationMs`, `walletId`, `providerId`, `transactionId` |
+| Cada mensagem da fila, com o resultado | `messageId`, `correlationId`, `transactionId`, `walletId`, `providerId`, `outcome`, `sqsMessageId` |
+| Divergência na reconciliação | `walletId`, `checkedEntries` |
+| Workers | id da transação ou do evento que falhou e o motivo |
+
+**correlationId.** Vem do header `x-correlation-id` de quem chamou. Se não vier, é gerado. Ele volta no header da
+resposta, vai pros eventos da outbox e aparece em todo log daquela requisição. Na fila, o `messageId` faz esse papel.
+
+**Sem dado sensível.** O código só passa ids pros logs, nunca valor. Como segunda barreira, o `JsonLogger` troca por
+`[redacted]` qualquer campo chamado `amount`, `balance`, `money`, `difference`, `payload`, `body`, `authorization` ou
+`password`, em qualquer nível de aninhamento. Tem teste que confere que nenhuma linha de log da suíte de observabilidade
+carrega o valor das apostas nem os saldos usados.
+
+### Métricas
+
+`GET /metrics` no formato do Prometheus, sem autenticação como os health checks. Cada instância expõe as suas.
+
+| Métrica | Tipo | O que mede |
+|---|---|---|
+| `wagering_transactions_total{channel, kind, status}` | counter | transações decididas, por canal (`http`, `sqs`, `worker`), kind e status |
+| `wagering_duplicates_total{type}` | counter | duplicatas reconhecidas: `idempotent_replay` pela key, `inbox_message` pela inbox |
+| `wagering_retries_total{source}` | counter | novas tentativas: `sqs_consumer`, `outbox`, `pending_reference` |
+| `wagering_dead_letters_total{reason}` | counter | mensagens que o consumer mandou pra DLQ, pelo tipo do erro |
+| `wagering_dlq_depth` | gauge | mensagens paradas na DLQ, inclusive as que chegaram pelo redrive do SQS |
+| `wagering_lock_conflicts_total{type}` | counter | `lock_timeout`, `deadlock`, `version_mismatch` e `idempotency_race` |
+| `wagering_outbox_pending` | gauge | eventos ainda não publicados |
+| `wagering_outbox_lag_seconds` | gauge | idade do evento pendente mais antigo |
+| `wagering_processing_duration_seconds{channel, outcome}` | histogram | latência do processamento, do recebimento ao commit |
+| `wagering_reconciliation_divergences_total` | counter | reconciliações em que o saldo não bateu com o ledger |
+
+**Como estão ligadas.** A aplicação só conhece a porta `Metrics`, com métodos de fato operacional
+(`transactionDecided`, `duplicateDetected`, `retryScheduled`...). Quem implementa é o `PrometheusMetrics`. Os use
+cases não sabem que existe Prometheus, e os testes que montam use case na mão usam um `NOOP_METRICS`.
+
+**Gauge lido na hora.** Outbox pendente, outbox lag e profundidade da DLQ não são contadores incrementados no código:
+são lidos do banco e do SQS na hora do scrape. Assim não desviam do estado real se um processo morrer no meio, e a
+DLQ conta até o que chegou lá pelo redrive, sem passar pelo código.
+
+**Transação por status.** O contador registra decisões. Uma transação que chega antes da referência conta uma vez
+como `PENDING_REFERENCE` no canal de entrada e depois uma vez com o status final no canal `worker`.
+
+**Registry por instância.** O `PrometheusMetrics` cria o próprio registry em vez de usar o global do `prom-client`.
+Isso evita conflito de nome de métrica quando os testes sobem várias apps no msm processo.
+
+### Health checks
+
+- `GET /health/live`: processo de pé, não toca em nada externo.
+- `GET /health/ready`: confere Postgres e a fila de entrada do SQS, com timeout. Responde 503 se algum cair.
+
+---
+
+## 8. Autenticação
+
+**Decisão: não implementar neste timebox.** O enunciado deixa explícito que autenticação não pontua e não deve
+competir com correção financeira, concorrência e idempotência.
+
+**Ponto de extensão no código.** O `ProviderAuthGuard`, em `src/interfaces/http/provider-auth.guard.ts`, está aplicado
+nas rotas de wallets e de transações e hoje libera tudo. Health e metrics ficam de fora dele, como o enunciado pede.
+
+**O desenho que eu adotaria**, com um IdP externo como Keycloak ou Zitadel no Docker Compose:
+
+1. Cada provedor é um *client* OIDC no IdP e pega token pelo fluxo `client_credentials`, máquina pra máquina.
+2. O `ProviderAuthGuard` valida a assinatura do JWT pelo JWKS do IdP, além de `iss`, `aud` e `exp`.
+3. O provedor autenticado vira o `providerId` daquela requisição. Se o `providerId` do corpo for diferente, a
+   requisição é recusada com 403. Hoje o `providerId` do corpo é confiado.
+4. Rotas de wallet e de reconciliação pediriam um papel diferente, de operador, e não o de provedor.
+
+**Fila.** Mensagens da fila são tratadas como canal interno confiável, como o enunciado define. A identidade do provedor
+dentro da mensagem continua passando pelas msmas validações de domínio: referência do msm provedor, msma wallet e
+msmo player.
+
+---
+
+## 9. Códigos de falha
 
 Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o resultado original;
 "corrigir" significa enviar uma nova transação.
@@ -474,7 +559,7 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 
 ---
 
-## 8. Interpretações das regras
+## 10. Interpretações das regras
 
 | Regra / ambiguidade | Interpretação adotada |
 |---|---|
@@ -494,7 +579,7 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 
 ---
 
-## 9. Testes
+## 11. Testes
 
 ### Teste antes do código
 
@@ -607,7 +692,7 @@ o teste de reinício não passava por acaso, ele ganhou a checagem de failover.
 
 ---
 
-## 10. Limitações conhecidas
+## 12. Limitações conhecidas
 
 ### Reversão por tipo
 
@@ -663,8 +748,6 @@ de duplicar.
 
 ### Testes de concorrência
 
-- As três instâncias da suíte `test/concurrency` usam portas fixas, 3101 a 3103. Se alguma estiver ocupada na máquina,
-  a suíte não sobe.
 - No Windows não tem `SIGTERM` de verdade entre processos: qualquer `kill` encerra na hora. Por isso o desligamento
   gracioso é testado dentro do processo, chamando o `stop()` do consumer e dos workers, e o teste multi-processo cobre o
   outro lado, a morte abrupta.
@@ -686,14 +769,14 @@ de duplicar.
 
 ---
 
-## 11. O que eu faria com mais tempo
+## 13. O que eu faria com mais tempo
 
 - _[quando terminar preciso lembrar de preencher]_
 - **Branded types pros ids** (`WalletId`, `TransactionId`...). Impedem passar um id no lugar de outro já em tempo de
   compilação. Ficou de fora pelo timebox, hoje todos são `string`.
-- **`exactOptionalPropertyTypes`**. Diferencia "campo ausente" de "campo `undefined`". Ia exigir ajustar todos os
-  estados opcionais (`processedAt`, `failureCode`...), então ficou pra depois.
 - **OpenAPI/Swagger** gerado a partir dos DTOs, pra documentar os contratos sem depender do README.
-- **`SendMessageBatch`** na outbox, mandando até 10 eventos por chamada ao SQS em vez de um por vez.
 - **Renovar a visibility** de cada mensagem antes de processar no consumer, e processar grupos diferentes do lote em
   paralelo em vez de um por vez.
+- **Autenticação de verdade** com Keycloak no Compose, seguindo o desenho da seção 8.
+- **Dashboard e alertas** em cima das métricas: outbox lag subindo, DLQ com mensagem, taxa de `lock_timeout` alta e
+  divergência de reconciliação, que deveria ser sempre zero.
