@@ -60,12 +60,14 @@ as garantias de unicidade, imutabilidade e não negatividade ficam em constraint
 
 ## 3. Mensageria (SQS)
 
-Filas com os nomes definidos no enunciado:
+As duas primeiras filas têm os nomes definidos no enunciado. A terceira é a saída dos eventos, que o enunciado não
+nomeia (ver seção 8):
 
 | Fila | Configuração |
 |---|---|
 | `wager-transactions.fifo` | FIFO, `ContentBasedDeduplication=false`, `VisibilityTimeout=30`, `RedrivePolicy` → DLQ com `maxReceiveCount=5` |
 | `wager-transactions-dlq.fifo` | FIFO |
+| `wager-events.fifo` | FIFO, `ContentBasedDeduplication=false`. Recebe os eventos de integração publicados pela outbox |
 
 - **`ContentBasedDeduplication=false`**: o produtor informa `MessageDeduplicationId` explicitamente, evitando
   que dois payloads idênticos com significados distintos sejam descartados pelo broker.
@@ -75,6 +77,73 @@ Filas com os nomes definidos no enunciado:
   _[a revisar]_ ajustar conforme a latência medida do processamento.
 - **FIFO não é garantia de consistência.** O `MessageGroupId` (planejado: `walletId`) reduz contenção, mas
   a correção depende do lock no banco e da inbox persistente.
+
+### Transactional outbox
+
+Os eventos são gravados na tabela `outbox_messages` na msm transação SQL da operação (seção 6). Um worker, o
+`OutboxPublisherWorker`, publica eles depois do commit. Nenhum evento sai antes do commit, pq até o commit ele nem
+existe pra quem está fora da transação.
+
+**Como um lote é publicado** (`PublishOutboxBatch`):
+
+1. Abre uma transação e pega até `OUTBOX_BATCH_SIZE` eventos pendentes e vencidos com
+   `SELECT ... FOR UPDATE SKIP LOCKED`, na ordem de `sequence`.
+2. Publica cada um no `wager-events.fifo` e marca `published_at`.
+3. Commit.
+
+**Várias instâncias ao msm tempo.** Toda instância roda o worker. O `SKIP LOCKED` faz cada uma pular as linhas que
+outra já travou, então duas instâncias nunca publicam o msm evento ao msm tempo e ninguém fica esperando ninguém.
+O teste roda dois publishers com pools separados sobre 60 eventos: cada evento sai exatamente uma vez e as duas
+instâncias trabalham.
+
+**O processo morre no meio.** O lock das linhas é da transação. Se o processo morre antes do commit, o Postgres faz
+rollback, as linhas destravam e outra instância publica. Nada se perde.
+
+**Publicação duplicada: at-least-once, de propósito.** Um evento pode ser publicado mais de uma vez. Acontece quando
+o processo publica no SQS e morre **antes** do commit que marca o evento como publicado. No rollback o evento volta
+pra pendente, e outra instância publica de novo.
+
+Isso é uma escolha, não um descuido. Entre o banco e o broker não existe "exatamente uma vez": são dois sistemas sem
+transação em comum, então sempre tem um instante entre "publiquei" e "registrei que publiquei" em que o processo pode
+morrer. Sobram duas opções:
+
+| Garantia | O que acontece no crash | Consequência |
+|---|---|---|
+| at-most-once: marca como publicado antes de publicar | o evento pode **nunca** sair | perde evento confirmado, o que o enunciado proíbe |
+| **at-least-once: publica e depois marca** | o evento pode sair **duas vezes** | nada se perde, e o duplicado é tratável |
+
+Perder evento não tem conserto depois. Duplicado tem, desde que dê pra reconhecer. Por isso a outbox é at-least-once
+e cada evento é feito pra ser reconhecível:
+
+- **`eventId` estável.** O id é gerado uma vez, quando o evento é gravado na outbox, e é o msm em toda republicação.
+  O consumidor guarda os `eventId` já tratados e ignora o que repetir. É o msm padrão da inbox que este serviço usa
+  pra mensagens que recebe, deduplicando por `(consumer, messageId)`.
+- **`MessageDeduplicationId = eventId`.** Dentro da janela de 5 min do SQS FIFO, o próprio broker descarta a cópia e o
+  consumidor nem vê. Fora da janela, quem segura é o consumidor.
+- **Eventos descrevem fatos, não comandos.** `WalletBalanceChanged` diz o saldo antes e depois e a `walletVersion`, não
+  "some X". Aplicar o msm fato duas vezes não muda o resultado pra quem usa esses campos.
+
+O enunciado pede exatamente isso: "uma publicação duplicada continua segura para o consumidor". O teste simula o
+caso: a instância A publica e "morre" antes do commit, a instância B publica de novo, e as duas publicações saem com o
+msm `eventId`.
+
+**Broker fora do ar.** Na primeira falha de publicação o lote para. O evento que falhou ganha `attempts + 1` e
+`next_attempt_at` com backoff (1s, 2s, 4s... até 60s), e os outros voltam pra fila sem tentativa contada. Sem isso,
+com o SQS fora, um lote de 50 seguraria a transação por até 50 timeouts de 5s tentando um broker que já se sabe que
+está fora. Não tem limite de tentativas: evento confirmado nunca é descartado, e um evento travado aparece no
+outbox lag.
+
+**Erro inesperado** que não é falha do broker derruba o lote inteiro com rollback. O worker loga e tenta de novo no
+próximo ciclo, sem parar o loop.
+
+**Shutdown.** O worker para no `onModuleDestroy`, que o Nest chama antes do `onApplicationShutdown` onde o pool do
+banco fecha. O `stop()` espera o lote em andamento terminar, então o shutdown não corta uma publicação no meio.
+
+| Variável | Padrão | Pra que serve |
+|---|---|---|
+| `OUTBOX_PUBLISHER_ENABLED` | `true` | liga o worker na instância |
+| `OUTBOX_POLL_INTERVAL_MS` | `500` | espera entre ciclos quando não tem nada pra publicar. Lote cheio emenda o próximo direto |
+| `OUTBOX_BATCH_SIZE` | `50` | eventos por transação |
 
 ---
 
@@ -279,7 +348,7 @@ só que como `REJECTED`. Por isso o corpo é o msm de uma processada, com o `fai
 - **Wallet com saldo inicial** gera uma transação `OPENING` e um `CREDIT` na msm transação SQL, e publica
   `WagerTransactionProcessed` e `WalletBalanceChanged` como qualquer outra operação que muda saldo.
 - **IDs são UUID v7** (`Bun.randomUUIDv7()`), ordenados por tempo, o que mantém o índice da PK compacto.
-- **Health:** `/health/live` não toca em nada, `/health/ready` confere o Postgres (o SQS entra com o consumer).
+- **Health:** `/health/live` não toca em nada, `/health/ready` confere o Postgres e a fila de entrada do SQS.
   Os dois ficam sem autenticação.
 
 ---
@@ -316,6 +385,7 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 | Valor zero | Só `LOSS` aceita `"0.00"`. Os demais kinds exigem valor positivo. |
 | `playerId` diferente do dono da wallet | `REJECTED` com `WALLET_PLAYER_MISMATCH` (persistido e auditável). |
 | Wallet aberta com saldo zero | Não gera transação `OPENING` nem lançamento. |
+| Pra onde a outbox publica | O enunciado não nomeia. Uma fila FIFO `wager-events.fifo`, com `MessageGroupId = walletId` e `MessageDeduplicationId = eventId`. O corpo é o envelope do evento. |
 | Formato de `playerId` e `walletId` | UUID, como nos exemplos do enunciado (coluna `uuid` no banco). `providerId`, `externalTransactionId`, `roundId` e `gameId` são texto livre. |
 
 ---
@@ -396,6 +466,20 @@ restringir a uma reversão por referência, independentemente do tipo.
 - Em dev o app conecta com o usuário dono das tabelas. Em produção, um role de aplicação sem `UPDATE`/`DELETE` no
   ledger seria uma segunda barreira além do trigger.
 
+### Ordem dos eventos
+
+A outbox publica em ordem de `sequence` e o `MessageGroupId` por wallet faz o SQS entregar na ordem em que recebeu.
+Mas com várias instâncias publicando ao msm tempo, dois eventos da msm wallet podem cair em lotes diferentes e sair
+fora de ordem. A ordem por wallet é melhor esforço. O consumidor que precisar de ordem estrita usa o
+`walletVersion` do `WalletBalanceChanged`, que cresce a cada mudança de saldo.
+
+### Lote da outbox segura o lock durante a publicação
+
+O lote publica com a transação aberta, segurando o lock das linhas até o commit. É o que deixa o desenho simples e
+seguro: morreu no meio, o rollback devolve tudo. O custo é a transação durar o tempo das chamadas ao SQS. Isso é
+limitado pelo tamanho do lote, pelo timeout de 5s por chamada e por parar no primeiro erro do broker. A alternativa
+seria um lease com coluna `claimed_until`, que publica fora da transação mas exige tratar lease expirado.
+
 ### Hot wallet
 
 O lock por wallet serializa as operações dela, então o throughput de **uma** wallet fica limitado ao tempo de uma
@@ -426,3 +510,4 @@ de duplicar.
 - **`exactOptionalPropertyTypes`**. Diferencia "campo ausente" de "campo `undefined`". Ia exigir ajustar todos os
   estados opcionais (`processedAt`, `failureCode`...), então ficou pra depois.
 - **OpenAPI/Swagger** gerado a partir dos DTOs, pra documentar os contratos sem depender do README.
+- **`SendMessageBatch`** na outbox, mandando até 10 eventos por chamada ao SQS em vez de um por vez.

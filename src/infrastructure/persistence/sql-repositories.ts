@@ -11,7 +11,7 @@ import type {
   WalletRepository,
 } from '../../application/ports';
 import { type LedgerDirection, WalletLedgerEntry } from '../../domain/ledger/wallet-ledger-entry';
-import type { OutboxMessage } from '../../domain/messaging/outbox-message';
+import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { Money } from '../../domain/money/money';
 import type { FailureCode } from '../../domain/wagering/failure-code';
 import {
@@ -331,6 +331,54 @@ class SqlOutboxRepository implements OutboxRepository {
       );
     }
   }
+
+  async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+    // SKIP LOCKED faz cada publisher pegar linhas diferentes sem esperar o outro
+    const rows = await this.em.execute<OutboxRow[]>(
+      `SELECT id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at, published_at
+         FROM outbox_messages
+        WHERE published_at IS NULL
+          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+        ORDER BY sequence
+        LIMIT ?
+        FOR UPDATE SKIP LOCKED`,
+      [now, limit],
+    );
+    return rows.map(toOutboxMessage);
+  }
+
+  async save(message: OutboxMessage): Promise<void> {
+    await this.em.execute(
+      `UPDATE outbox_messages SET attempts = ?, next_attempt_at = ?, published_at = ? WHERE id = ?`,
+      [message.attempts, message.nextAttemptAt ?? null, message.publishedAt ?? null, message.id],
+      'run',
+    );
+  }
+}
+
+interface OutboxRow {
+  id: string;
+  aggregate_id: string;
+  event_type: string;
+  payload: Record<string, unknown> | string;
+  occurred_at: DbTimestamp;
+  attempts: number;
+  next_attempt_at: DbTimestamp | null;
+  published_at: DbTimestamp | null;
+}
+
+function toOutboxMessage(row: OutboxRow): OutboxMessage {
+  return OutboxMessage.rehydrate({
+    id: row.id,
+    aggregateId: row.aggregate_id,
+    eventType: row.event_type,
+    // jsonb pode chegar já parseado ou como texto dependendo do driver
+    payload: typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
+    occurredAt: toDate(row.occurred_at),
+    attempts: row.attempts,
+    nextAttemptAt: optionalDate(row.next_attempt_at),
+    publishedAt: optionalDate(row.published_at),
+  });
 }
 
 export function createScope(em: EntityManager): TransactionScope {

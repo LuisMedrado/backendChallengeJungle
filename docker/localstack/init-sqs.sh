@@ -23,4 +23,10 @@ awslocal sqs create-queue \
     \"RedrivePolicy\": \"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"5\\\"}\"
   }"
 
-echo "SQS pronto, do transactions pro transactions-dlq"
+# fila de saída dos eventos de integração que a outbox publica
+# group por wallet mantém a ordem dos eventos da msm wallet
+awslocal sqs create-queue \
+  --queue-name wager-events.fifo \
+  --attributes FifoQueue=true,ContentBasedDeduplication=false
+
+echo "SQS pronto, do transactions pro transactions-dlq e a fila de eventos"

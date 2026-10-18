@@ -32,8 +32,8 @@ services:
       # volume pros scripts de inicializacao
       - ./docker/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
     healthcheck:
-      # so sobe com healthy dps de criar a fila principal
-      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-transactions.fifo >/dev/null 2>&1"]
+      # so sobe com healthy dps de criar a ultima fila do script
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wager-events.fifo >/dev/null 2>&1"]
       interval: 3s
       timeout: 5s
       retries: 30

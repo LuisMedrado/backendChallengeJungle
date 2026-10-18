@@ -10,7 +10,8 @@ import {
   type ReconciliationReport,
 } from './application/use-cases/queries';
 import { PersistenceModule } from './infrastructure/persistence/persistence.module';
-import { SystemClock, UuidV7Generator } from './infrastructure/system';
+import { MessagingModule } from './infrastructure/messaging/messaging.module';
+import { SystemModule } from './infrastructure/system.module';
 import { CLOCK, ID_GENERATOR, UNIT_OF_WORK } from './infrastructure/tokens';
 import { HealthController } from './interfaces/http/health.controller';
 import { WageringController } from './interfaces/http/wagering.controller';
@@ -22,11 +23,9 @@ const writeDeps = [UNIT_OF_WORK, CLOCK, ID_GENERATOR];
 const reconciliationLogger = new Logger('Reconciliation');
 
 @Module({
-  imports: [PersistenceModule],
+  imports: [SystemModule, PersistenceModule, MessagingModule],
   controllers: [HealthController, WalletsController, WageringController],
   providers: [
-    { provide: CLOCK, useClass: SystemClock },
-    { provide: ID_GENERATOR, useClass: UuidV7Generator },
     {
       provide: CreateWallet,
       useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator) => new CreateWallet(uow, clock, ids),
