@@ -24,7 +24,8 @@ As decisões, trade-offs e limitações estão no [ARCHITECTURE.md](ARCHITECTURE
 | Consumer SQS com inbox, retry e DLQ | pronto, com testes de integração (redelivery, crash antes do ack, SIGTERM) |
 | Worker de referências pendentes | pronto, com testes de integração (backoff, limite de tentativas, workers concorrentes) |
 | Testes com três processos simultâneos e reinício | pronto |
-| Logs estruturados e métricas | a fazer |
+| Logs estruturados em JSON e métricas Prometheus | pronto, com testes de integração |
+| Autenticação | não implementada de propósito, com ponto de extensão no código. Desenho no ARCHITECTURE.md, seção 8 |
 
 ## Arquitetura
 
@@ -90,6 +91,8 @@ Tudo vem do `.env` (copiado do `.env.example`):
 
 As portas do Postgres (5432) e do LocalStack (4566) ficam publicadas só em `127.0.0.1`.
 
+> **Portas em uso:** o projeto precisa das portas 5432, 4566 e 3000 livres. Os testes pegam portas livres sozinhos, então não entram nessa conta. Se já tiver um Postgres local rodando, o `infra:up` falha ao publicar a 5432. Pare o serviço que ocupa a porta antes de subir. Pra mudar a porta da API, ajuste o `PORT` no `.env`.
+
 ## Uso
 
 ```bash
@@ -113,7 +116,8 @@ curl http://localhost:3000/health/live
 | `POST /wagering/transactions` | submete uma operação (header `Idempotency-Key` obrigatório) |
 | `GET /wagering/transactions/:transactionId` | consulta pelo id interno |
 | `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | consulta pelo id do provedor |
-| `GET /health/live`, `GET /health/ready` | liveness e readiness (sem autenticação) |
+| `GET /health/live`, `GET /health/ready` | liveness e readiness, sem autenticação |
+| `GET /metrics` | métricas no formato do Prometheus, sem autenticação |
 
 Exemplo, criando uma wallet e apostando 25.00:
 
@@ -138,6 +142,29 @@ Outros comandos:
 | `bun run infra:logs` | acompanha os logs dos containers |
 | `bun run infra:down` | derruba os containers e apaga os volumes |
 
+## Observabilidade
+
+**Logs.** Saem em JSON, uma linha por entrada, prontos pra qualquer agregador. Cada requisição HTTP e cada mensagem da fila gera uma linha com `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`, além de status e duração. O `x-correlation-id` de quem chama é respeitado e devolvido na resposta. Se não vier, é gerado. Valores de dinheiro e payloads nunca vão pro log, e o logger ainda redige esses campos se algum escapar.
+
+**Métricas.** Em `GET /metrics`, no formato do Prometheus:
+
+```bash
+curl http://localhost:3000/metrics
+```
+
+| Métrica | O que mostra |
+|---|---|
+| `wagering_transactions_total` | transações por canal, kind e status |
+| `wagering_duplicates_total` | replays pela idempotency key e mensagens repetidas barradas pela inbox |
+| `wagering_retries_total` | novas tentativas do consumer, da outbox e das referências pendentes |
+| `wagering_dead_letters_total`, `wagering_dlq_depth` | mensagens enviadas pra DLQ e quantas estão paradas lá |
+| `wagering_lock_conflicts_total` | lock timeout, deadlock, version que mudou e corrida de idempotência |
+| `wagering_outbox_pending`, `wagering_outbox_lag_seconds` | eventos esperando publicação e há quanto tempo o mais velho espera |
+| `wagering_processing_duration_seconds` | latência do processamento, do recebimento ao commit |
+| `wagering_reconciliation_divergences_total` | reconciliações em que o saldo não bateu com o ledger |
+
+Os detalhes de cada uma estão no [ARCHITECTURE.md](ARCHITECTURE.md), seção 7.
+
 ## Estrutura do projeto
 
 ```
@@ -149,8 +176,8 @@ Outros comandos:
 ├── src/
 │   ├── domain/                  # regras de negócio puras
 │   ├── application/             # use cases, portas e payloadHash
-│   ├── infrastructure/          # MikroORM, SQS e os workers da outbox e das referências pendentes
-│   ├── interfaces/http/         # controllers e configuração HTTP
+│   ├── infrastructure/          # MikroORM, SQS, workers, logger JSON e métricas
+│   ├── interfaces/http/         # controllers, log por requisição e /metrics
 │   ├── interfaces/sqs/          # consumer da fila de entrada
 │   ├── app.module.ts
 │   └── main.ts
@@ -212,7 +239,7 @@ bun run test:concurrency
 
 Os testes de integração e de concorrência usam Postgres e SQS de verdade, então precisam do `bun run infra:up` antes. Cada arquivo começa recriando o schema (migration down e depois up) no banco `wagering_test`.
 
-O `test:concurrency` sobe três processos da aplicação nas portas 3101 a 3103 e testa os três ao mesmo tempo: disputa de saldo, a mesma aposta enviada dezenas de vezes, três consumers na mesma fila e uma instância morta no meio da carga e reiniciada. A suíte inteira leva perto de 2 minutos. Para feedback rápido, use `test:unit`.
+O `test:concurrency` sobe três processos da aplicação em portas livres escolhidas na hora e testa os três ao mesmo tempo: disputa de saldo, a mesma aposta enviada dezenas de vezes, três consumers na mesma fila e uma instância morta no meio da carga e reiniciada. A suíte inteira leva perto de 2 minutos. Para feedback rápido, use `test:unit`.
 
 Toda suíte que mexe em saldo termina conferindo que o saldo de **todas** as wallets do banco bate com o ledger.
 
