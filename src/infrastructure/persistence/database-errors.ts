@@ -4,7 +4,7 @@ import {
   LockWaitTimeoutException,
   UniqueConstraintViolationException,
 } from '@mikro-orm/core';
-import { DuplicateKeyError, TransientInfrastructureError } from '../../application/errors';
+import { DuplicateKeyError, TransientInfrastructureError, type TransientReason } from '../../application/errors';
 
 // códigos do postgres e do node que valem retry: serialização, deadlock, lock timeout,
 // banco reiniciando, conexão caiu, muitas conexões
@@ -37,7 +37,14 @@ export function translateDatabaseError(error: unknown): unknown {
     error instanceof LockWaitTimeoutException ||
     (typeof code === 'string' && TRANSIENT_CODES.has(code))
   ) {
-    return new TransientInfrastructureError('banco indisponível ou em contenção, tenta de novo');
+    return new TransientInfrastructureError('banco indisponível ou em contenção, tenta de novo', transientReason(error, code));
   }
   return error;
+}
+
+function transientReason(error: unknown, code: unknown): TransientReason {
+  if (error instanceof LockWaitTimeoutException || code === '55P03') return 'lock_timeout';
+  if (error instanceof DeadlockException || code === '40P01') return 'deadlock';
+  if (code === '40001') return 'serialization';
+  return 'unavailable';
 }

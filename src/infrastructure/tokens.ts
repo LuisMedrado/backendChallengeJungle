@@ -8,3 +8,4 @@ export const EVENT_PUBLISHER = Symbol('EVENT_PUBLISHER');
 export const OUTBOX_WORKER = Symbol('OUTBOX_WORKER');
 export const SQS_CONSUMER = Symbol('SQS_CONSUMER');
 export const PENDING_REFERENCE_WORKER = Symbol('PENDING_REFERENCE_WORKER');
+export const METRICS = Symbol('METRICS');

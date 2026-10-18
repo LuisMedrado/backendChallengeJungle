@@ -9,7 +9,7 @@ import {
 } from '../../application/errors';
 import type { ProcessWagerTransaction } from '../../application/use-cases/process-wager-transaction';
 import { CurrencyMismatchError, InvalidMoneyError, InvalidWagerTransactionError } from '../../domain/shared/errors';
-import type { HandleOutcome, IncomingMessage, MessageHandler } from './sqs-wager-consumer';
+import type { HandleOutcome, IncomingMessage, MessageContext, MessageHandler } from './sqs-wager-consumer';
 import { InvalidMessageError, parseWagerMessage } from './wager-message';
 
 // erros em que tentar de novo dá o msm resultado: vão direto pra DLQ
@@ -37,9 +37,17 @@ export class WagerMessageHandler implements MessageHandler {
   ) {}
 
   async handle({ body }: IncomingMessage): Promise<HandleOutcome> {
+    // ids que vão no log de qualquer resultado, preenchidos conforme a mensagem vai sendo entendida
+    const context: MessageContext = {};
     try {
       const message = await parseWagerMessage(body);
       const { idempotencyKey, ...data } = message.data;
+      Object.assign(context, {
+        messageId: message.messageId,
+        correlationId: message.messageId,
+        walletId: data.walletId,
+        providerId: data.providerId,
+      });
 
       const result = await this.processWager.executeFromQueue(
         { ...data, idempotencyKey, trace: { correlationId: message.messageId, causationId: message.messageId } },
@@ -52,17 +60,19 @@ export class WagerMessageHandler implements MessageHandler {
 
       if ('duplicateMessage' in result) {
         if (result.payloadMismatch) {
-          this.logger.warn(`mensagem ${message.messageId} repetida com conteúdo diferente, mantido o processamento original`);
+          this.logger.warn({ msg: 'mensagem repetida com conteúdo diferente, mantido o processamento original', ...context });
         }
-        return { action: 'ack', detail: 'mensagem já processada' };
+        return { action: 'ack', detail: 'mensagem já processada', context };
       }
-      return { action: 'ack', detail: `transação ${result.transaction.id} ${result.transaction.status}` };
+      context.transactionId = result.transaction.id;
+      return { action: 'ack', detail: `transação ${result.transaction.status}`, context };
     } catch (error) {
-      if (PERMANENT_ERRORS.some((type) => error instanceof type)) {
-        return { action: 'dead-letter', detail: describe(error) };
+      const permanent = PERMANENT_ERRORS.find((type) => error instanceof type);
+      if (permanent) {
+        return { action: 'dead-letter', detail: describe(error), reason: permanent.name, context };
       }
       if (TRANSIENT_ERRORS.some((type) => error instanceof type)) {
-        return { action: 'retry', detail: describe(error) };
+        return { action: 'retry', detail: describe(error), context };
       }
       // erro inesperado sobe, o consumer trata como retry e o limite de tentativas leva pra DLQ
       throw error;

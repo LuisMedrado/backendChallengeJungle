@@ -7,10 +7,16 @@ import {
   WagerTransactionKind,
   WagerTransactionStatus,
 } from '../../domain/wagering/wager-transaction';
-import { DuplicateKeyError, IdempotencyConflictError, WalletNotFoundError } from '../errors';
+import {
+  ConcurrentModificationError,
+  DuplicateKeyError,
+  IdempotencyConflictError,
+  TransientInfrastructureError,
+  WalletNotFoundError,
+} from '../errors';
 import { type EventTrace, outboxMessagesFor } from '../events';
 import { computePayloadHash } from '../idempotency/payload-hash';
-import type { Clock, IdGenerator, TransactionScope, UnitOfWork } from '../ports';
+import { type Channel, type Clock, type IdGenerator, type Metrics, NOOP_METRICS, type TransactionScope, type UnitOfWork } from '../ports';
 
 export interface ProcessWagerCommand {
   idempotencyKey: string;
@@ -71,6 +77,7 @@ export class ProcessWagerTransaction {
     private readonly uow: UnitOfWork,
     private readonly clock: Clock,
     private readonly ids: IdGenerator,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {}
 
   /** entrada http */
@@ -89,6 +96,36 @@ export class ProcessWagerTransaction {
     command: ProcessWagerCommand,
     inbox: InboxEntry | undefined,
   ): Promise<ProcessWagerResult | DuplicateMessageResult> {
+    const channel: Channel = inbox ? 'sqs' : 'http';
+    const started = performance.now();
+    const elapsed = () => (performance.now() - started) / 1000;
+    try {
+      const result = await this.process(command, inbox);
+      if ('duplicateMessage' in result) {
+        this.metrics.duplicateDetected('inbox_message');
+        this.metrics.processingObserved(channel, 'duplicate_message', elapsed());
+      } else if (result.idempotentReplay) {
+        this.metrics.duplicateDetected('idempotent_replay');
+        this.metrics.processingObserved(channel, 'idempotent_replay', elapsed());
+      } else {
+        this.metrics.transactionDecided(channel, result.transaction.kind, result.transaction.status);
+        this.metrics.processingObserved(channel, result.transaction.status, elapsed());
+      }
+      return result;
+    } catch (error) {
+      if (error instanceof TransientInfrastructureError && error.reason !== 'unavailable' && error.reason !== 'serialization') {
+        this.metrics.lockConflict(error.reason);
+      }
+      if (error instanceof ConcurrentModificationError) this.metrics.lockConflict('version_mismatch');
+      this.metrics.processingObserved(channel, 'error', elapsed());
+      throw error;
+    }
+  }
+
+  private async process(
+    command: ProcessWagerCommand,
+    inbox: InboxEntry | undefined,
+  ): Promise<ProcessWagerResult | DuplicateMessageResult> {
     // valida tudo que dá antes de abrir transação, payload ruim nem chega no banco
     const money = Money.from(command.money);
     const { kind } = command;
@@ -103,6 +140,7 @@ export class ProcessWagerTransaction {
       // duas requisições da msm operação passaram pela checagem ao msm tempo
       // a unique do banco barrou a segunda, na nova tentativa ela acha a primeira
       if (error instanceof DuplicateKeyError && error.constraint && IDEMPOTENCY_CONSTRAINTS.has(error.constraint)) {
+        this.metrics.lockConflict('idempotency_race');
         return this.attempt(command, kind, money, payloadHash, inbox);
       }
       throw error;

@@ -7,15 +7,25 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import { Logger } from '@nestjs/common';
+import { type Metrics, NOOP_METRICS } from '../../application/ports';
 
 export interface IncomingMessage {
   body: string;
 }
 
+/** ids da operação pra ir no log, sem valor nenhum de dinheiro */
+export interface MessageContext {
+  messageId?: string;
+  correlationId?: string;
+  transactionId?: string;
+  walletId?: string;
+  providerId?: string;
+}
+
 export type HandleOutcome =
-  | { action: 'ack'; detail: string }
-  | { action: 'retry'; detail: string }
-  | { action: 'dead-letter'; detail: string };
+  | { action: 'ack'; detail: string; context?: MessageContext }
+  | { action: 'retry'; detail: string; context?: MessageContext }
+  | { action: 'dead-letter'; detail: string; reason: string; context?: MessageContext };
 
 export interface MessageHandler {
   handle(message: IncomingMessage): Promise<HandleOutcome>;
@@ -48,6 +58,7 @@ export class SqsWagerConsumer {
     private readonly sqs: SQSClient,
     private readonly handler: MessageHandler,
     private readonly options: ConsumerOptions,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {}
 
   start(): void {
@@ -97,7 +108,7 @@ export class SqsWagerConsumer {
         await this.pollOnce();
       } catch (error) {
         if (!this.running) break;
-        this.logger.error(`falha ao ler a fila: ${describe(error)}`);
+        this.logger.error({ msg: 'falha ao ler a fila', error: describe(error) });
         await Bun.sleep(1_000);
       }
     }
@@ -127,34 +138,37 @@ export class SqsWagerConsumer {
     try {
       return await this.handler.handle({ body: message.Body ?? '' });
     } catch (error) {
-      this.logger.error(`erro inesperado na mensagem ${message.MessageId}: ${describe(error)}`);
+      this.logger.error({ msg: 'erro inesperado ao processar mensagem', sqsMessageId: message.MessageId, error: describe(error) });
       return { action: 'retry', detail: 'erro inesperado' };
     }
   }
 
   private async apply(message: Message, outcome: HandleOutcome): Promise<void> {
-    const id = message.MessageId;
+    // log estruturado com os ids, o detalhe nunca carrega valor de dinheiro
+    const fields = { sqsMessageId: message.MessageId, outcome: outcome.action, detail: outcome.detail, ...outcome.context };
     try {
       switch (outcome.action) {
         case 'ack':
           await this.delete(message);
-          this.logger.log(`mensagem ${id} ok: ${outcome.detail}`);
+          this.logger.log({ msg: 'mensagem processada', ...fields });
           break;
         case 'dead-letter':
           await this.sendToDeadLetter(message, outcome.detail);
           await this.delete(message);
-          this.logger.warn(`mensagem ${id} enviada pra DLQ: ${outcome.detail}`);
+          this.metrics.deadLettered(outcome.reason);
+          this.logger.warn({ msg: 'mensagem enviada pra DLQ', reason: outcome.reason, ...fields });
           break;
         case 'retry': {
           const delay = this.retryDelaySeconds(message);
           await this.changeVisibility(message, delay);
-          this.logger.warn(`mensagem ${id} volta em ${delay}s: ${outcome.detail}`);
+          this.metrics.retryScheduled('sqs_consumer');
+          this.logger.warn({ msg: 'mensagem volta pra fila com backoff', retryInSeconds: delay, ...fields });
           break;
         }
       }
     } catch (error) {
       // falhou o ack ou a DLQ: a mensagem reaparece sozinha e a inbox segura o reprocessamento
-      this.logger.error(`falha ao finalizar a mensagem ${id}: ${describe(error)}`);
+      this.logger.error({ msg: 'falha ao finalizar mensagem', error: describe(error), ...fields });
     }
   }
 
@@ -173,7 +187,7 @@ export class SqsWagerConsumer {
     try {
       await this.changeVisibility(message, 0);
     } catch (error) {
-      this.logger.error(`falha ao devolver a mensagem ${message.MessageId}: ${describe(error)}`);
+      this.logger.error({ msg: 'falha ao devolver mensagem pra fila', sqsMessageId: message.MessageId, error: describe(error) });
     }
   }
 

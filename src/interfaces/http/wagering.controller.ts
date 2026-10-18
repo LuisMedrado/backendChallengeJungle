@@ -1,8 +1,9 @@
-import { Body, Controller, Get, Headers, Inject, Param, ParseUUIDPipe, Post, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Inject, Param, ParseUUIDPipe, Post, Res, UseGuards } from '@nestjs/common';
 import type { IdGenerator } from '../../application/ports';
 import { ProcessWagerTransaction } from '../../application/use-cases/process-wager-transaction';
 import { GetWagerTransaction } from '../../application/use-cases/queries';
 import { ID_GENERATOR } from '../../infrastructure/tokens';
+import { ProviderAuthGuard } from './provider-auth.guard';
 import { SubmitWagerDto } from './dto';
 import { httpStatusFor, presentSubmitResult, presentTransaction } from './presenters';
 import { requireIdempotencyKey, traceFrom } from './request-context';
@@ -11,6 +12,7 @@ interface StatusResponse {
   status(code: number): unknown;
 }
 
+@UseGuards(ProviderAuthGuard)
 @Controller()
 export class WageringController {
   constructor(

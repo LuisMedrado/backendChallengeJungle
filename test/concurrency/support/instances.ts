@@ -15,8 +15,29 @@ export interface HttpResult {
   body: any;
 }
 
+// pede portas livres pro sistema e solta logo em seguida, pra não depender de porta fixa na máquina de quem roda
+// segura todas abertas até o fim pra o sistema não devolver a msm porta duas vezes
+export async function freePorts(count: number): Promise<number[]> {
+  const probes = Array.from({ length: count }, () =>
+    Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => new Response() }),
+  );
+  const ports = probes.map((probe) => probe.port);
+  await Promise.all(probes.map((probe) => probe.stop(true)));
+  return ports.map((port) => {
+    if (port === undefined) throw new Error('o sistema não devolveu porta livre');
+    return port;
+  });
+}
+
+export async function freePort(): Promise<number> {
+  const [port] = await freePorts(1);
+  return port!;
+}
+
 // sobe um processo da aplicação de verdade, com http, consumer e os dois workers ligados
-export async function startInstance(port: number): Promise<Instance> {
+// sem porta, pega uma livre. o restart passa a porta da instância morta pra subir no msm lugar
+export async function startInstance(port?: number): Promise<Instance> {
+  port ??= await freePort();
   const child = Bun.spawn([process.execPath, 'src/main.ts'], {
     cwd: PROJECT_ROOT,
     env: {

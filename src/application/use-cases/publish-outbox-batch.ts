@@ -1,5 +1,5 @@
 import { EventPublishError } from '../errors';
-import type { Clock, EventPublisher, UnitOfWork } from '../ports';
+import { type Clock, type EventPublisher, type Metrics, NOOP_METRICS, type UnitOfWork } from '../ports';
 
 export interface PublishOutboxResult {
   published: number;
@@ -16,6 +16,7 @@ export class PublishOutboxBatch {
     private readonly publisher: EventPublisher,
     private readonly clock: Clock,
     private readonly batchSize: number,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {}
 
   execute(): Promise<PublishOutboxResult> {
@@ -35,6 +36,7 @@ export class PublishOutboxBatch {
           if (!(error instanceof EventPublishError)) throw error;
           message.scheduleRetry(now);
           await scope.outbox.save(message);
+          this.metrics.retryScheduled('outbox');
           result.failed += 1;
           // broker fora: para aqui em vez de esperar o timeout de cada evento segurando o lock do lote.
           // os que não foram tentados voltam pra fila sem tentativa contada quando a transação commita
