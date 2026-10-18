@@ -3,17 +3,38 @@ import {
   type Message,
   PurgeQueueCommand,
   ReceiveMessageCommand,
+  SendMessageCommand,
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 
-export function eventsQueueUrl(): string {
-  const url = process.env.SQS_EVENTS_QUEUE_URL;
-  if (!url) throw new Error('SQS_EVENTS_QUEUE_URL não definida, copia o .env.example pra .env');
+function queueUrlFromEnv(name: string): string {
+  const url = process.env[name];
+  if (!url) throw new Error(`${name} não definida, copia o .env.example pra .env`);
   return url;
 }
 
+export const eventsQueueUrl = (): string => queueUrlFromEnv('SQS_EVENTS_QUEUE_URL');
+export const wagerQueueUrl = (): string => queueUrlFromEnv('SQS_QUEUE_URL');
+export const deadLetterQueueUrl = (): string => queueUrlFromEnv('SQS_DLQ_URL');
+
 export async function purgeQueue(client: SQSClient, queueUrl: string): Promise<void> {
   await client.send(new PurgeQueueCommand({ QueueUrl: queueUrl }));
+}
+
+export async function sendToQueue(
+  client: SQSClient,
+  queueUrl: string,
+  body: unknown,
+  options: { groupId?: string; deduplicationId?: string } = {},
+): Promise<void> {
+  await client.send(
+    new SendMessageCommand({
+      QueueUrl: queueUrl,
+      MessageBody: typeof body === 'string' ? body : JSON.stringify(body),
+      MessageGroupId: options.groupId ?? 'test-group',
+      MessageDeduplicationId: options.deduplicationId ?? crypto.randomUUID(),
+    }),
+  );
 }
 
 // lê e apaga tudo que tiver na fila, para quando duas leituras seguidas voltam vazias

@@ -6,3 +6,4 @@ export const ID_GENERATOR = Symbol('ID_GENERATOR');
 export const SQS_CLIENT = Symbol('SQS_CLIENT');
 export const EVENT_PUBLISHER = Symbol('EVENT_PUBLISHER');
 export const OUTBOX_WORKER = Symbol('OUTBOX_WORKER');
+export const SQS_CONSUMER = Symbol('SQS_CONSUMER');

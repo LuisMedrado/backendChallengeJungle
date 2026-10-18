@@ -145,6 +145,59 @@ banco fecha. O `stop()` espera o lote em andamento terminar, então o shutdown n
 | `OUTBOX_POLL_INTERVAL_MS` | `500` | espera entre ciclos quando não tem nada pra publicar. Lote cheio emenda o próximo direto |
 | `OUTBOX_BATCH_SIZE` | `50` | eventos por transação |
 
+### Consumer da fila de entrada
+
+O `SqsWagerConsumer` lê o `wager-transactions.fifo` e entrega cada mensagem pro `WagerMessageHandler`, que chama o
+**msm `ProcessWagerTransaction` do HTTP**. Não tem regra de negócio duplicada: a fila é só outra porta de entrada.
+
+**Inbox na msm transação.** A entrada pela fila passa um registro de inbox pro use case, que grava
+`(consumer_name, message_id)` como **primeiro passo da transação SQL**, antes do lock da wallet. O insert usa
+`ON CONFLICT DO NOTHING`:
+
+- inseriu: segue normal e o registro da inbox commita junto com a transação, o saldo, o ledger e a outbox;
+- já existia: é a msm mensagem chegando de novo, o use case para ali sem tocar em nada e o consumer faz ack;
+- deu erro depois: o rollback desfaz a inbox também, então a redelivery processa como se fosse a primeira vez.
+
+Duas entregas da msm mensagem ao msm tempo também ficam seguras: a segunda espera a primeira commitar no índice
+único e aí cai no conflito. Se a msm `messageId` voltar com conteúdo diferente, o consumer mantém o processamento
+original, faz ack e loga um aviso, pq isso indica erro de quem publicou.
+
+São duas camadas de deduplicação com papéis diferentes: a **inbox** reconhece a msm *mensagem* e a **idempotency
+key** reconhece a msm *operação* mesmo vindo em mensagens diferentes. As duas estão no banco.
+
+**Ack só depois do commit.** O `DeleteMessage` só roda depois que o handler voltou, e o handler só volta depois do
+commit. Se o processo morre entre o commit e o ack, a mensagem reaparece depois do visibility timeout e a inbox
+reconhece. O teste simula exatamente isso.
+
+**Três tipos de falha, três destinos:**
+
+| Tipo | Exemplos | O que o consumer faz |
+|---|---|---|
+| Negócio | saldo insuficiente, referência inválida, moeda diferente da wallet | **ack**. A transação foi gravada como `REJECTED` com `failureCode` e evento na outbox. Reenviar daria o msm resultado |
+| Transitório | banco fora, `lock_timeout`, deadlock, version mudou no meio | **sem ack**. Muda a visibility pra voltar com backoff: 1s, 2s, 4s... até 60s, pelo `ApproximateReceiveCount`. Depois de 5 recebimentos o redrive do SQS manda pra DLQ |
+| Permanente | JSON quebrado, campo inválido, `OPENING` vindo da fila, wallet inexistente, msm key com outro payload | **direto pra DLQ** e apaga da fila. Tentar de novo não muda nada, então não gasta as 5 tentativas |
+
+Erro **inesperado** que não se encaixa em nenhum dos três é tratado como transitório. Se for bug, esgota as tentativas
+e cai na DLQ do msm jeito, sem perder a mensagem.
+
+**Ordem dentro do grupo.** O `MessageGroupId` das mensagens é a `walletId`. Se uma mensagem do lote falha com erro
+transitório, as próximas do msm grupo no msm lote são devolvidas pra fila sem processar. Assim nenhuma passa na
+frente da que falhou. Mensagens de outros grupos seguem normal.
+
+**SIGTERM.** O `enableShutdownHooks` do Nest chama o `onModuleDestroy`, que para o consumer antes do pool do banco
+fechar. O `stop()`:
+
+1. corta o long polling na hora, sem esperar os até 20s do receive;
+2. deixa a mensagem que já está sendo processada terminar e fazer o ack;
+3. devolve as que sobraram no lote com visibility zero, pra outra instância pegar na hora em vez de esperar 30s.
+
+| Variável | Padrão | Pra que serve |
+|---|---|---|
+| `SQS_CONSUMER_ENABLED` | `true` | liga o consumer na instância |
+| `SQS_WAIT_TIME_SECONDS` | `20` | long polling do receive |
+| `SQS_RETRY_BASE_DELAY_SECONDS` | `1` | primeiro intervalo do backoff de erro transitório |
+| `SQS_RETRY_MAX_DELAY_SECONDS` | `60` | teto do backoff |
+
 ---
 
 ## 4. Modelo de domínio
@@ -288,15 +341,16 @@ transação.
 
 ### Fluxo de uma operação
 
-Um use case só, `ProcessWagerTransaction`, atende o HTTP e vai atender a fila. Tudo dentro de **uma** transação SQL:
+Um use case só, `ProcessWagerTransaction`, atende o HTTP e a fila. Tudo dentro de **uma** transação SQL:
 
 1. Valida o que dá antes de abrir transação (formato do dinheiro, kind permitido) e calcula o `payloadHash`.
-2. Trava a wallet com `SELECT ... FOR UPDATE`. Se não existe, é 404.
-3. Procura a operação pela idempotency key ou por `(providerId, externalTransactionId)`.
+2. Se veio pela fila, registra a mensagem na inbox. Se já estava lá, para aqui sem fazer nada (seção 3).
+3. Trava a wallet com `SELECT ... FOR UPDATE`. Se não existe, é 404.
+4. Procura a operação pela idempotency key ou por `(providerId, externalTransactionId)`.
    Achou com msm key e msm hash: replay, devolve o resultado guardado. Achou com outra coisa: 409.
-4. Cria a `WagerTransaction`, busca a referência (se tiver) e roda o `WagerSettlement` do domínio.
-5. Grava a transação, o saldo novo (`UPDATE ... WHERE version = ?`), o lançamento e os eventos na outbox.
-6. Commit. Só depois disso a resposta sai.
+5. Cria a `WagerTransaction`, busca a referência (se tiver) e roda o `WagerSettlement` do domínio.
+6. Grava a transação, o saldo novo (`UPDATE ... WHERE version = ?`), o lançamento e os eventos na outbox.
+7. Commit. Só depois disso a resposta sai, ou o ack da mensagem acontece.
 
 ### Concorrência
 
@@ -385,6 +439,9 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 | Valor zero | Só `LOSS` aceita `"0.00"`. Os demais kinds exigem valor positivo. |
 | `playerId` diferente do dono da wallet | `REJECTED` com `WALLET_PLAYER_MISMATCH` (persistido e auditável). |
 | Wallet aberta com saldo zero | Não gera transação `OPENING` nem lançamento. |
+| Quais erros da fila são permanentes | Payload inválido, wallet inexistente e conflito de idempotência vão direto pra DLQ, pq repetir dá o msm resultado. Regra de negócio não é erro: vira `REJECTED` e a mensagem é ack. |
+| Status `FAILED` | O enunciado define, mas nenhuma rota de hoje grava. Mensagem que esgota as tentativas por erro de infraestrutura nunca chegou a commitar transação nenhuma, então não tem linha pra marcar como `FAILED`. O registro auditável dela é a DLQ, com o motivo no atributo `reason`, mais o log. |
+| `correlationId` de quem vem pela fila | A mensagem do enunciado não tem um. O `messageId` vira o `correlationId` e o `causationId` dos eventos gerados, o que liga cada evento à mensagem que causou ele. |
 | Pra onde a outbox publica | O enunciado não nomeia. Uma fila FIFO `wager-events.fifo`, com `MessageGroupId = walletId` e `MessageDeduplicationId = eventId`. O corpo é o envelope do evento. |
 | Formato de `playerId` e `walletId` | UUID, como nos exemplos do enunciado (coluna `uuid` no banco). `providerId`, `externalTransactionId`, `roundId` e `gameId` são texto livre. |
 
@@ -480,6 +537,21 @@ seguro: morreu no meio, o rollback devolve tudo. O custo é a transação durar 
 limitado pelo tamanho do lote, pelo timeout de 5s por chamada e por parar no primeiro erro do broker. A alternativa
 seria um lease com coluna `claimed_until`, que publica fora da transação mas exige tratar lease expirado.
 
+### Visibility timeout do lote no consumer
+
+O consumer recebe até 10 mensagens e processa uma por vez. O visibility timeout de 30s conta a partir do receive,
+pra todas do lote ao msm tempo. Se várias mensagens do lote baterem no `lock_timeout` de 5s, as últimas podem
+reaparecer pra outra instância antes de serem processadas. A correção continua garantida pela inbox e pelo lock da
+wallet, então não duplica nada, mas gera retrabalho. A solução seria renovar a visibility de cada mensagem logo antes
+de processar ela. Ficou de fora pq eu não consegui escrever um teste que falhasse sem isso sem mudar o timeout da fila
+que os outros testes usam, e não implemento comportamento sem teste.
+
+### Envio pra DLQ não é atômico
+
+Mandar pra DLQ e apagar da fila de entrada são duas chamadas ao SQS. Se o processo morre entre as duas, a mensagem
+volta e vai pra DLQ de novo. A DLQ é pra análise humana e o `MessageDeduplicationId` é o `MessageId` original, então
+dentro da janela de 5 min o SQS descarta a cópia. Fora dela, aparece duplicada na DLQ, o que é aceitável.
+
 ### Hot wallet
 
 O lock por wallet serializa as operações dela, então o throughput de **uma** wallet fica limitado ao tempo de uma
@@ -511,3 +583,5 @@ de duplicar.
   estados opcionais (`processedAt`, `failureCode`...), então ficou pra depois.
 - **OpenAPI/Swagger** gerado a partir dos DTOs, pra documentar os contratos sem depender do README.
 - **`SendMessageBatch`** na outbox, mandando até 10 eventos por chamada ao SQS em vez de um por vez.
+- **Renovar a visibility** de cada mensagem antes de processar no consumer, e processar grupos diferentes do lote em
+  paralelo em vez de um por vez.

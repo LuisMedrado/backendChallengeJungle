@@ -2,6 +2,8 @@ import type { QueryResult } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import { ConcurrentModificationError } from '../../application/errors';
 import type {
+  InboxRegistration,
+  InboxRepository,
   LedgerPageItem,
   LedgerRepository,
   LedgerSummary,
@@ -11,6 +13,7 @@ import type {
   WalletRepository,
 } from '../../application/ports';
 import { type LedgerDirection, WalletLedgerEntry } from '../../domain/ledger/wallet-ledger-entry';
+import type { InboxMessage } from '../../domain/messaging/inbox-message';
 import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { Money } from '../../domain/money/money';
 import type { FailureCode } from '../../domain/wagering/failure-code';
@@ -381,11 +384,37 @@ function toOutboxMessage(row: OutboxRow): OutboxMessage {
   });
 }
 
+// ---- inbox_messages
+
+class SqlInboxRepository implements InboxRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async register(message: InboxMessage): Promise<InboxRegistration> {
+    // ON CONFLICT DO NOTHING: a segunda entrega da msm mensagem não gera erro, só não insere.
+    // se as duas chegarem juntas, a segunda espera a primeira commitar antes de decidir
+    const inserted = await this.em.execute<{ message_id: string }[]>(
+      `INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at, processed_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (consumer_name, message_id) DO NOTHING
+       RETURNING message_id`,
+      [message.consumerName, message.messageId, message.payloadHash, message.receivedAt, message.receivedAt],
+    );
+    if (inserted.length > 0) return { registered: true };
+
+    const existing = await this.em.execute<{ payload_hash: string }[]>(
+      'SELECT payload_hash FROM inbox_messages WHERE consumer_name = ? AND message_id = ?',
+      [message.consumerName, message.messageId],
+    );
+    return { registered: false, payloadHash: existing[0]?.payload_hash ?? '' };
+  }
+}
+
 export function createScope(em: EntityManager): TransactionScope {
   return {
     wallets: new SqlWalletRepository(em),
     transactions: new SqlWagerTransactionRepository(em),
     ledger: new SqlLedgerRepository(em),
     outbox: new SqlOutboxRepository(em),
+    inbox: new SqlInboxRepository(em),
   };
 }

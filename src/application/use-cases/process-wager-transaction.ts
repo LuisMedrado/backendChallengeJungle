@@ -1,4 +1,5 @@
 import { Money, type MoneyProps } from '../../domain/money/money';
+import { InboxMessage } from '../../domain/messaging/inbox-message';
 import { InvalidWagerTransactionError } from '../../domain/shared/errors';
 import { WagerSettlement } from '../../domain/wagering/wager-settlement';
 import {
@@ -30,6 +31,20 @@ export interface ProcessWagerResult {
   idempotentReplay: boolean;
 }
 
+/** registro na inbox de quem consome da fila, gravado na msm transação dos efeitos */
+export interface InboxEntry {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+}
+
+/** a msm mensagem já foi processada antes por esse consumer, nada é feito */
+export interface DuplicateMessageResult {
+  duplicateMessage: true;
+  /** msm messageId com conteúdo diferente, vale log pq indica erro de quem publicou */
+  payloadMismatch: boolean;
+}
+
 // kinds que podem vir de fora, OPENING é interno
 const SUBMITTABLE_KINDS: ReadonlySet<string> = new Set([
   WagerTransactionKind.Bet,
@@ -58,7 +73,22 @@ export class ProcessWagerTransaction {
     private readonly ids: IdGenerator,
   ) {}
 
-  async execute(command: ProcessWagerCommand): Promise<ProcessWagerResult> {
+  /** entrada http */
+  execute(command: ProcessWagerCommand): Promise<ProcessWagerResult> {
+    return this.run(command, undefined);
+  }
+
+  /** entrada pela fila, com inbox: redelivery da msm mensagem é reconhecida e não faz nada */
+  executeFromQueue(command: ProcessWagerCommand, inbox: InboxEntry): Promise<ProcessWagerResult | DuplicateMessageResult> {
+    return this.run(command, inbox);
+  }
+
+  private run(command: ProcessWagerCommand, inbox: undefined): Promise<ProcessWagerResult>;
+  private run(command: ProcessWagerCommand, inbox: InboxEntry): Promise<ProcessWagerResult | DuplicateMessageResult>;
+  private async run(
+    command: ProcessWagerCommand,
+    inbox: InboxEntry | undefined,
+  ): Promise<ProcessWagerResult | DuplicateMessageResult> {
     // valida tudo que dá antes de abrir transação, payload ruim nem chega no banco
     const money = Money.from(command.money);
     const { kind } = command;
@@ -68,12 +98,12 @@ export class ProcessWagerTransaction {
     const payloadHash = computePayloadHash(command);
 
     try {
-      return await this.attempt(command, kind, money, payloadHash);
+      return await this.attempt(command, kind, money, payloadHash, inbox);
     } catch (error) {
       // duas requisições da msm operação passaram pela checagem ao msm tempo
       // a unique do banco barrou a segunda, na nova tentativa ela acha a primeira
       if (error instanceof DuplicateKeyError && error.constraint && IDEMPOTENCY_CONSTRAINTS.has(error.constraint)) {
-        return this.attempt(command, kind, money, payloadHash);
+        return this.attempt(command, kind, money, payloadHash, inbox);
       }
       throw error;
     }
@@ -84,8 +114,20 @@ export class ProcessWagerTransaction {
     kind: WagerTransactionKind,
     money: Money,
     payloadHash: string,
-  ): Promise<ProcessWagerResult> {
+    inbox: InboxEntry | undefined,
+  ): Promise<ProcessWagerResult | DuplicateMessageResult> {
     return this.uow.transactional(async (scope) => {
+      // inbox antes de tudo: se a msm mensagem já foi processada, para aqui sem tocar em nada.
+      // como está na msm transação, se algo abaixo falhar o registro da inbox também volta
+      if (inbox) {
+        const registration = await scope.inbox.register(
+          InboxMessage.receive({ ...inbox, receivedAt: this.clock.now() }),
+        );
+        if (!registration.registered) {
+          return { duplicateMessage: true, payloadMismatch: registration.payloadHash !== inbox.payloadHash };
+        }
+      }
+
       // lock por wallet: toda operação da msm wallet passa por aqui em fila, wallets diferentes em paralelo
       const wallet = await scope.wallets.lockById(command.walletId);
       if (!wallet) throw new WalletNotFoundError(command.walletId);
