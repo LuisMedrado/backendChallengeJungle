@@ -183,6 +183,10 @@ export class ProcessWagerTransaction {
         await scope.ledger.insert(ledgerEntry);
       }
       await scope.outbox.add(outboxMessagesFor(transaction, wallet, ledgerEntry, command.trace, this.ids, this.clock));
+      // quem estava esperando por essa transação não precisa esperar o backoff, o worker pega no próximo ciclo
+      if (transaction.isTerminal()) {
+        await scope.transactions.wakeUpDependents(transaction.providerId, transaction.externalTransactionId, now);
+      }
 
       return { transaction, idempotentReplay: false };
     });

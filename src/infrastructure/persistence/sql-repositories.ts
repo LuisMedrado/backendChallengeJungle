@@ -199,6 +199,53 @@ class SqlWagerTransactionRepository implements WagerTransactionRepository {
     return rows[0]?.found === true;
   }
 
+  async update(tx: WagerTransaction): Promise<void> {
+    // só as colunas de processamento, o trigger recusa mudança nas que vieram do provedor
+    await this.em.execute(
+      `UPDATE wager_transactions
+          SET status = ?, failure_code = ?, balance_after = ?, reference_transaction_id = ?,
+              reference_attempts = ?, next_reference_check_at = ?, processed_at = ?, updated_at = now()
+        WHERE id = ?`,
+      [
+        tx.status,
+        tx.failureCode ?? null,
+        tx.balanceAfter?.amount ?? null,
+        tx.referenceTransactionId ?? null,
+        tx.referenceAttempts,
+        tx.nextReferenceCheckAt ?? null,
+        tx.processedAt ?? null,
+        tx.id,
+      ],
+      'run',
+    );
+  }
+
+  async findDuePendingReferences(now: Date, limit: number): Promise<string[]> {
+    // usa o índice parcial wager_tx_pending_reference_due_ix
+    const rows = await this.em.execute<{ id: string }[]>(
+      `SELECT id FROM wager_transactions
+        WHERE status = 'PENDING_REFERENCE' AND next_reference_check_at <= ?
+        ORDER BY next_reference_check_at
+        LIMIT ?`,
+      [now, limit],
+    );
+    return rows.map((row) => row.id);
+  }
+
+  async wakeUpDependents(providerId: string, externalTransactionId: string, now: Date): Promise<void> {
+    // usa o índice parcial wager_tx_waiting_for_reference_ix
+    await this.em.execute(
+      `UPDATE wager_transactions
+          SET next_reference_check_at = ?, updated_at = now()
+        WHERE status = 'PENDING_REFERENCE'
+          AND provider_id = ?
+          AND reference_external_transaction_id = ?
+          AND next_reference_check_at > ?`,
+      [now, providerId, externalTransactionId, now],
+      'run',
+    );
+  }
+
   async insert(tx: WagerTransaction): Promise<void> {
     await this.em.execute(
       `INSERT INTO wager_transactions (

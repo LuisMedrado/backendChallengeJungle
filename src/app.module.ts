@@ -3,6 +3,7 @@ import type { SQSClient } from '@aws-sdk/client-sqs';
 import type { Clock, IdGenerator, UnitOfWork } from './application/ports';
 import { CreateWallet } from './application/use-cases/create-wallet';
 import { ProcessWagerTransaction } from './application/use-cases/process-wager-transaction';
+import { ResolvePendingReferences } from './application/use-cases/resolve-pending-references';
 import {
   GetWagerTransaction,
   GetWallet,
@@ -14,7 +15,8 @@ import { booleanEnv, positiveIntEnv, requireEnv } from './infrastructure/config'
 import { PersistenceModule } from './infrastructure/persistence/persistence.module';
 import { MessagingModule } from './infrastructure/messaging/messaging.module';
 import { SystemModule } from './infrastructure/system.module';
-import { CLOCK, ID_GENERATOR, SQS_CLIENT, SQS_CONSUMER, UNIT_OF_WORK } from './infrastructure/tokens';
+import { CLOCK, ID_GENERATOR, PENDING_REFERENCE_WORKER, SQS_CLIENT, SQS_CONSUMER, UNIT_OF_WORK } from './infrastructure/tokens';
+import { PendingReferenceWorker } from './infrastructure/workers/pending-reference.worker';
 import { HealthController } from './interfaces/http/health.controller';
 import { WageringController } from './interfaces/http/wagering.controller';
 import { WalletsController } from './interfaces/http/wallets.controller';
@@ -71,19 +73,33 @@ const WAGER_CONSUMER_NAME = 'wager-transactions-consumer';
         }),
       inject: [SQS_CLIENT, ProcessWagerTransaction],
     },
+    {
+      provide: PENDING_REFERENCE_WORKER,
+      useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator) =>
+        new PendingReferenceWorker(
+          new ResolvePendingReferences(uow, clock, ids, positiveIntEnv('PENDING_REFERENCE_BATCH_SIZE', 50)),
+          positiveIntEnv('PENDING_REFERENCE_POLL_INTERVAL_MS', 1_000),
+        ),
+      inject: writeDeps,
+    },
   ],
 })
 export class AppModule implements OnApplicationBootstrap, OnModuleDestroy {
-  constructor(@Inject(SQS_CONSUMER) private readonly consumer: SqsWagerConsumer) {}
+  constructor(
+    @Inject(SQS_CONSUMER) private readonly consumer: SqsWagerConsumer,
+    @Inject(PENDING_REFERENCE_WORKER) private readonly pendingReferenceWorker: PendingReferenceWorker,
+  ) {}
 
   // toda instância consome, o lock por wallet e a inbox seguram a concorrência entre elas
   onApplicationBootstrap(): void {
     if (booleanEnv('SQS_CONSUMER_ENABLED', true)) this.consumer.start();
+    // toda instância roda, a transação de cada pendente trava a wallet e quem chegar depois pula
+    if (booleanEnv('PENDING_REFERENCE_WORKER_ENABLED', true)) this.pendingReferenceWorker.start();
   }
 
   // no SIGTERM o nest chama isso antes de fechar o pool do banco:
   // para de receber, termina a mensagem em andamento e devolve as outras pra fila
   async onModuleDestroy(): Promise<void> {
-    await this.consumer.stop();
+    await Promise.all([this.consumer.stop(), this.pendingReferenceWorker.stop()]);
   }
 }

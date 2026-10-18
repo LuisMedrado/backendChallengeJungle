@@ -22,7 +22,7 @@ As decisões, trade-offs e limitações estão no [ARCHITECTURE.md](ARCHITECTURE
 | API HTTP e use cases | pronto, com testes e2e (inclusive concorrência real) |
 | Outbox publisher | pronto, com testes de integração (publishers concorrentes e crash antes do commit) |
 | Consumer SQS com inbox, retry e DLQ | pronto, com testes de integração (redelivery, crash antes do ack, SIGTERM) |
-| Worker de referências pendentes | a fazer |
+| Worker de referências pendentes | pronto, com testes de integração (backoff, limite de tentativas, workers concorrentes) |
 | Logs estruturados e métricas | a fazer |
 
 ## Arquitetura
@@ -84,6 +84,7 @@ Tudo vem do `.env` (copiado do `.env.example`):
 | `SQS_EVENTS_QUEUE_URL` | fila de saída onde a outbox publica os eventos |
 | `OUTBOX_PUBLISHER_ENABLED`, `OUTBOX_POLL_INTERVAL_MS`, `OUTBOX_BATCH_SIZE` | liga o publisher da outbox, intervalo entre ciclos e tamanho do lote |
 | `SQS_CONSUMER_ENABLED`, `SQS_WAIT_TIME_SECONDS`, `SQS_RETRY_BASE_DELAY_SECONDS`, `SQS_RETRY_MAX_DELAY_SECONDS` | liga o consumer da fila de entrada, long polling e backoff de erro transitório |
+| `PENDING_REFERENCE_WORKER_ENABLED`, `PENDING_REFERENCE_POLL_INTERVAL_MS`, `PENDING_REFERENCE_BATCH_SIZE` | liga o worker que reprocessa operações que chegaram antes da referência |
 | `DB_LOCK_TIMEOUT_MS` | quanto uma operação espera o lock da wallet antes de desistir com 503 (padrão 5000) |
 
 As portas do Postgres (5432) e do LocalStack (4566) ficam publicadas só em `127.0.0.1`.
@@ -147,7 +148,7 @@ Outros comandos:
 ├── src/
 │   ├── domain/                  # regras de negócio puras
 │   ├── application/             # use cases, portas e payloadHash
-│   ├── infrastructure/          # MikroORM, SQS e o worker da outbox
+│   ├── infrastructure/          # MikroORM, SQS e os workers da outbox e das referências pendentes
 │   ├── interfaces/http/         # controllers e configuração HTTP
 │   ├── interfaces/sqs/          # consumer da fila de entrada
 │   ├── app.module.ts

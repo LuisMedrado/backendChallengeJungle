@@ -28,6 +28,12 @@ export interface WagerTransactionRepository {
   findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
   hasProcessedReversal(referenceTransactionId: string, kind: WagerTransactionKind): Promise<boolean>;
   insert(transaction: WagerTransaction): Promise<void>;
+  /** grava o avanço do processamento, os campos que vieram do provedor não mudam */
+  update(transaction: WagerTransaction): Promise<void>;
+  /** ids das transações PENDING_REFERENCE com o backoff vencido, as mais atrasadas primeiro */
+  findDuePendingReferences(now: Date, limit: number): Promise<string[]>;
+  /** antecipa pra agora o próximo check de quem esperava por essa transação do provedor */
+  wakeUpDependents(providerId: string, externalTransactionId: string, now: Date): Promise<void>;
 }
 
 export interface LedgerPageItem {
