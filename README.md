@@ -19,7 +19,7 @@ As decisões, trade-offs e limitações estão no [ARCHITECTURE.md](ARCHITECTURE
 | Ambiente local (Postgres + LocalStack/SQS) | pronto |
 | Domínio (Money, Wallet, ledger, regras de aposta) | pronto, com testes unitários |
 | Schema, migrations e constraints | pronto, com testes de integração |
-| API HTTP e use cases | em desenvolvimento |
+| API HTTP e use cases | pronto, com testes e2e (inclusive concorrência real) |
 | Consumer SQS, outbox publisher e worker de referências pendentes | a fazer |
 | Logs estruturados e métricas | a fazer |
 
@@ -79,6 +79,7 @@ Tudo vem do `.env` (copiado do `.env.example`):
 | `DATABASE_URL_TEST` | banco dos testes de integração |
 | `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | acesso ao SQS do LocalStack (credenciais `test`/`test`) |
 | `SQS_QUEUE_URL`, `SQS_DLQ_URL` | fila principal e DLQ |
+| `DB_LOCK_TIMEOUT_MS` | quanto uma operação espera o lock da wallet antes de desistir com 503 (padrão 5000) |
 
 As portas do Postgres (5432) e do LocalStack (4566) ficam publicadas só em `127.0.0.1`.
 
@@ -93,6 +94,32 @@ Sobe a API com reload automático. Para conferir se está no ar:
 ```bash
 curl http://localhost:3000/health/live
 ```
+
+### Endpoints
+
+| Método e rota | O que faz |
+|---|---|
+| `POST /wallets` | cria wallet (saldo inicial > 0 gera um lançamento de abertura) |
+| `GET /wallets/:walletId` | saldo e version |
+| `GET /wallets/:walletId/ledger?cursor=&limit=` | lançamentos, paginados por cursor |
+| `POST /wallets/:walletId/reconciliation` | compara o saldo com a soma do ledger |
+| `POST /wagering/transactions` | submete uma operação (header `Idempotency-Key` obrigatório) |
+| `GET /wagering/transactions/:transactionId` | consulta pelo id interno |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | consulta pelo id do provedor |
+| `GET /health/live`, `GET /health/ready` | liveness e readiness (sem autenticação) |
+
+Exemplo, criando uma wallet e apostando 25.00:
+
+```bash
+curl -X POST http://localhost:3000/wallets -H "content-type: application/json" -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"1000.00","currency":"BRL"}}'
+```
+```bash
+curl -X POST http://localhost:3000/wagering/transactions -H "content-type: application/json" -H "Idempotency-Key: provider-a:transaction-123" -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<id da wallet>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+```
+
+A resposta traz `"status":"PROCESSED"` e saldo `975.00`. Mandar a mesma requisição de novo devolve o mesmo resultado
+com `"idempotentReplay":true`, sem debitar outra vez. Os status HTTP de cada situação (200, 202, 400, 404, 409, 422,
+503) estão explicados no [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Outros comandos:
 

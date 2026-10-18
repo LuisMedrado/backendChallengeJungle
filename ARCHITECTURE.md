@@ -7,11 +7,12 @@
 3. [Mensageria](#3-mensageria-sqs)
 4. [Modelo de domínio](#4-modelo-de-domínio)
 5. [Persistência e schema](#5-persistência-e-schema)
-6. [Códigos de falha](#6-códigos-de-falha)
-7. [Interpretações das regras](#7-interpretações-das-regras)
-8. [Testes](#8-testes)
-9. [Limitações](#9-limitações-conhecidas)
-10. [O que eu faria com mais tempo](#10-o-que-eu-faria-com-mais-tempo)
+6. [Processamento e API](#6-processamento-e-api)
+7. [Códigos de falha](#7-códigos-de-falha)
+8. [Interpretações das regras](#8-interpretações-das-regras)
+9. [Testes](#9-testes)
+10. [Limitações](#10-limitações-conhecidas)
+11. [O que eu faria com mais tempo](#11-o-que-eu-faria-com-mais-tempo)
 
 ---
 
@@ -32,7 +33,7 @@ as garantias de unicidade, imutabilidade e não negatividade ficam em constraint
 | Runtime / pacotes / testes | Bun 1.x | Exigido no projeto, executa TypeScript e carrega as deps. |
 | Framework | NestJS 11 | Exigido no projeto, DI e hooks (como o `enableShutdownHooks`) usados no shutdown. |
 | Banco | PostgreSQL 17 | Exigido no projeto, Versão estável atual. |
-| Mensageria | LocalStack 4.4 (SQS) | Exigido (LocalStack ou MiniStack). Tem limitações, descritas na seção 9. |
+| Mensageria | LocalStack 4.4 (SQS) | Exigido (LocalStack ou MiniStack). Tem limitações, descritas na seção 10. |
 | Orquestração | Docker Compose | Exigido no projeto. |
 
 ### Decisões
@@ -150,8 +151,13 @@ na outbox é o `eventId`, então uma publicação duplicada chega com o mesmo id
 
 ### ORM e migrations
 
-- **MikroORM** (o preferencial do enunciado). Unit of Work, `em.transactional()` e `LockMode` explícitos combinam
-  com o que o processamento precisa: travar a wallet, aplicar tudo e commitar junto.
+- **MikroORM** (o preferencial do enunciado). Ele cuida da transação (`em.transactional()`), do pool de conexões e
+  das migrations. Os repositórios escrevem **SQL explícito** pelo `em.execute()` em vez de mapear entidades.
+  O motivo é que as partes críticas dependem de SQL que eu quero visível e testado: `SELECT ... FOR UPDATE` na wallet,
+  violação de unique virando decisão de negócio, e o join pra trazer a moeda da wallet. O domínio já tem classes
+  ricas com `create`/`rehydrate`, então uma camada de entidade do ORM no meio seria mais um mapeamento sem ganho.
+  O custo é não usar o Identity Map nem o `LockMode` do ORM, e escrever o mapeamento linha → domínio à mão.
+- O driver do MikroORM devolve `timestamptz` como string, não como `Date`. Os mapeamentos convertem explícito (ver achado 2 na seção 9).
 - As migrations são **SQL escrito à mão** dentro das classes de migration do MikroORM, cada uma com `up` e `down`.
   O schema é parte do que é avaliado, então prefiro controlar cada constraint em vez de deixar o ORM gerar.
 - A lista de migrations é explícita (`migrations/index.ts`) em vez de glob no disco. Funciona igual no Bun e no Node.
@@ -209,7 +215,76 @@ transação.
 
 ---
 
-## 6. Códigos de falha
+## 6. Processamento e API
+
+### Fluxo de uma operação
+
+Um use case só, `ProcessWagerTransaction`, atende o HTTP e vai atender a fila. Tudo dentro de **uma** transação SQL:
+
+1. Valida o que dá antes de abrir transação (formato do dinheiro, kind permitido) e calcula o `payloadHash`.
+2. Trava a wallet com `SELECT ... FOR UPDATE`. Se não existe, é 404.
+3. Procura a operação pela idempotency key ou por `(providerId, externalTransactionId)`.
+   Achou com msm key e msm hash: replay, devolve o resultado guardado. Achou com outra coisa: 409.
+4. Cria a `WagerTransaction`, busca a referência (se tiver) e roda o `WagerSettlement` do domínio.
+5. Grava a transação, o saldo novo (`UPDATE ... WHERE version = ?`), o lançamento e os eventos na outbox.
+6. Commit. Só depois disso a resposta sai.
+
+### Concorrência
+
+- **Lock pessimista por wallet** (`SELECT ... FOR UPDATE`). A unidade de concorrência é a `walletId`: operações da
+  msm wallet entram em fila no banco, wallets diferentes rodam em paralelo. Não tem lock global.
+- Escolhi pessimista e não otimista pq numa hot wallet (muita aposta na msm wallet) o otimista gera retry em cascata.
+  Com o lock cada operação espera a vez uma vez só. Como cada transação trava uma wallet só, não tem como dar deadlock.
+- O `UPDATE` do saldo ainda confere a `version` como segunda barreira. Se não bater, nada é gravado e a resposta é 503.
+- **`lock_timeout` por transação** (achado 3 na seção 9). `SET LOCAL lock_timeout`, padrão 5s, `DB_LOCK_TIMEOUT_MS`. Quem espera o lock
+  segura uma conexão do pool. Sem limite, uma wallet travada prenderia todas as conexões e derrubaria as outras
+  wallets junto. Com o limite, quem passa do tempo recebe 503 com `Retry-After` e nada é gravado.
+- Isolamento `READ COMMITTED` (padrão do Postgres). Depois de pegar o lock, cada SELECT enxerga o que a transação
+  anterior da msm wallet commitou, então a checagem de idempotência e a busca da referência veem o estado atual.
+
+### Corrida de idempotência
+
+Duas requisições com a msm key mas `walletId` diferentes travam wallets diferentes, então as duas passam pela checagem
+ao msm tempo. Aí quem barra é a unique do banco: a segunda falha no insert, a transação inteira faz rollback e o use
+case tenta **uma** vez de novo. Na nova tentativa ela acha a primeira e vira replay ou 409. O teste de 50 requisições
+iguais em paralelo cobre isso.
+
+### Status HTTP
+
+| Situação | Status | Corpo |
+|---|---|---|
+| Processada (inclusive replay) | 200 | `{ transactionId, status, balance, idempotentReplay }` |
+| Rejeitada por regra de negócio | 422 | msm formato + `failureCode` |
+| Aceita aguardando referência | 202 | msm formato, `balance: null` |
+| Payload inválido, header faltando, cursor inválido | 400 | `{ error: { code: "INVALID_PAYLOAD", message } }` |
+| Wallet ou transação não existe | 404 | `WALLET_NOT_FOUND` / `TRANSACTION_NOT_FOUND` |
+| Msm key com outro payload, wallet duplicada | 409 | `IDEMPOTENCY_KEY_CONFLICT` / `WALLET_ALREADY_EXISTS` |
+| Banco fora, lock timeout, deadlock | 503 + `Retry-After` | `SERVICE_UNAVAILABLE` |
+
+O replay devolve o **msm status** da resposta original (uma rejeição reenviada continua 422), então o provedor
+decide pelo status e nunca precisa ler a mensagem.
+
+Rejeição de negócio não é erro HTTP no sentido de exceção: a transação foi aceita, decidida e gravada (auditável),
+só que como `REJECTED`. Por isso o corpo é o msm de uma processada, com o `failureCode` a mais.
+
+### Outras decisões da API
+
+- **Validação em duas camadas.** O DTO (class-validator) confere tipo, UUID, kind e campos desconhecidos
+  (`forbidNonWhitelisted`). O formato do dinheiro fica com o `Money.from` do domínio, pra regra não ficar duplicada.
+- **Idempotency-Key obrigatória** no header, até 255 caracteres. É ela que identifica a operação, não o corpo.
+- **`x-correlation-id`** opcional: se vier, vai pros eventos da outbox, se não, é gerado.
+- **Ledger paginado por cursor opaco** (`base64url` da `sequence` do último item). Limite padrão 50, máximo 200.
+- **Reconciliação** compara o saldo da wallet com a soma do ledger. Divergência é logada e devolvida com
+  `consistent: false`, **nunca corrigida**. É `POST` pq é uma verificação sob demanda com efeito (log/métrica).
+- **Wallet com saldo inicial** gera uma transação `OPENING` e um `CREDIT` na msm transação SQL, e publica
+  `WagerTransactionProcessed` e `WalletBalanceChanged` como qualquer outra operação que muda saldo.
+- **IDs são UUID v7** (`Bun.randomUUIDv7()`), ordenados por tempo, o que mantém o índice da PK compacto.
+- **Health:** `/health/live` não toca em nada, `/health/ready` confere o Postgres (o SQS entra com o consumer).
+  Os dois ficam sem autenticação.
+
+---
+
+## 7. Códigos de falha
 
 Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o resultado original;
 "corrigir" significa enviar uma nova transação.
@@ -230,7 +305,7 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 
 ---
 
-## 7. Interpretações das regras
+## 8. Interpretações das regras
 
 | Regra / ambiguidade | Interpretação adotada |
 |---|---|
@@ -245,7 +320,7 @@ Persistidos em `failure_code`. Reenviar a mesma idempotency key sempre devolve o
 
 ---
 
-## 8. Testes
+## 9. Testes
 
 ### Teste antes do código
 
@@ -253,8 +328,39 @@ A partir da Fase 2 os testes são escritos **antes** da implementação. O fluxo
 e só depois implementar até passar. Assim o teste descreve o comportamento esperado e não vira um espelho do código que
 já existe (teste feito pra passar).
 
-A Fase 1 (domínio) foi feita com o código primeiro e os testes logo depois. Mesmo assim, um deles pegou um bug real:
-reaplicar uma transação já decidida debitava a wallet de novo antes de falhar.
+A Fase 1 (domínio) foi feita com o código primeiro e os testes logo depois.
+
+### Achados
+
+Problemas reais que apareceram durante o desenvolvimento, e como foram resolvidos.
+
+**1. Débito duplicado ao reaplicar uma transação (Fase 1, domínio)**
+
+- **Como apareceu:** um teste unitário reaplicava uma BET já processada esperando erro. O erro vinha, mas o saldo
+  já tinha sido debitado de novo.
+- **Causa:** o `WagerSettlement` mexia na wallet primeiro e só depois tentava mudar o status da transação, que é
+  quando a regra de estado terminal lançava o erro.
+- **Correção:** checar se a transação já é terminal **antes** de qualquer mutação. O banco também barra pela
+  idempotência, mas o domínio não pode depender disso.
+
+**2. Datas chegando como string do banco (Fase 3, persistência)**
+
+- **Como apareceu:** os testes e2e das consultas (ledger e transação por id) davam 500. Com o app rodando com log de
+  erro ligado, apareceu `createdAt.toISOString is not a function`.
+- **Causa:** o driver do MikroORM devolve `timestamptz` como **string**, e não como `Date` como o `pg` puro faz. Num
+  teste chamando o repositório direto o erro não aparecia, pq ali a data nem era usada.
+- **Correção:** os mapeamentos linha → domínio convertem explícito (`toDate`), em vez de confiar no tipo que o driver
+  devolve.
+
+**3. Hot wallet esgotando o pool de conexões (Fase 3, concorrência)**
+
+- **Como apareceu:** na revisão do lock pessimista. Quem espera o `SELECT ... FOR UPDATE` fica parado **segurando uma
+  conexão do pool**. Se uma wallet ficar travada (transação lenta, processo pendurado), as requisições dela vão
+  ocupando todas as conexões e as outras wallets param junto, mesmo sem ter nada a ver.
+- **Como provei:** um teste e2e trava a wallet por outra conexão e manda uma aposta. Antes da correção a requisição
+  ficava pendurada até o teste estourar o tempo (5s).
+- **Correção:** `SET LOCAL lock_timeout` no começo de cada transação (padrão 5s, `DB_LOCK_TIMEOUT_MS`). Quem passa do
+  tempo recebe 503 com `Retry-After`, nada é gravado, e reenviar com a msm key processa normal depois.
 
 ### Camadas
 
@@ -272,7 +378,7 @@ de erro **e o nome da constraint**. Assim um teste não passa por acidente por c
 
 ---
 
-## 9. Limitações conhecidas
+## 10. Limitações conhecidas
 
 ### Reversão por tipo
 
@@ -290,6 +396,13 @@ restringir a uma reversão por referência, independentemente do tipo.
 - Em dev o app conecta com o usuário dono das tabelas. Em produção, um role de aplicação sem `UPDATE`/`DELETE` no
   ledger seria uma segunda barreira além do trigger.
 
+### Hot wallet
+
+O lock por wallet serializa as operações dela, então o throughput de **uma** wallet fica limitado ao tempo de uma
+transação. É a troca consciente por correção: wallets diferentes continuam em paralelo. Sob contenção forte numa
+wallet só, parte das requisições passa do `lock_timeout` e recebe 503, e o provedor reenvia com a msm key sem risco
+de duplicar.
+
 ### LocalStack
 
 - É uma emulação da API, não a AWS. O LocalStack responde às mesmas chamadas HTTP do SQS em
@@ -305,6 +418,11 @@ restringir a uma reversão por referência, independentemente do tipo.
 
 ---
 
-## 10. O que eu faria com mais tempo
+## 11. O que eu faria com mais tempo
 
 - _[quando terminar preciso lembrar de preencher]_
+- **Branded types pros ids** (`WalletId`, `TransactionId`...). Impedem passar um id no lugar de outro já em tempo de
+  compilação. Ficou de fora pelo timebox, hoje todos são `string`.
+- **`exactOptionalPropertyTypes`**. Diferencia "campo ausente" de "campo `undefined`". Ia exigir ajustar todos os
+  estados opcionais (`processedAt`, `failureCode`...), então ficou pra depois.
+- **OpenAPI/Swagger** gerado a partir dos DTOs, pra documentar os contratos sem depender do README.
