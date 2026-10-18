@@ -2,7 +2,7 @@ import { FailureCode } from '../../domain/wagering/failure-code';
 import { WagerSettlement } from '../../domain/wagering/wager-settlement';
 import { WagerTransactionStatus } from '../../domain/wagering/wager-transaction';
 import { outboxMessagesFor } from '../events';
-import type { Clock, IdGenerator, UnitOfWork } from '../ports';
+import { type Clock, type IdGenerator, type Metrics, NOOP_METRICS, type UnitOfWork } from '../ports';
 
 export interface ResolvePendingReferencesResult {
   /** referência chegou e a operação foi aplicada */
@@ -25,6 +25,7 @@ export class ResolvePendingReferences {
     private readonly clock: Clock,
     private readonly ids: IdGenerator,
     private readonly batchSize: number,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {}
 
   async execute(): Promise<ResolvePendingReferencesResult> {
@@ -37,6 +38,7 @@ export class ResolvePendingReferences {
       try {
         const outcome = await this.resolve(transactionId);
         if (outcome !== 'skipped') result[outcome] += 1;
+        if (outcome === 'rescheduled') this.metrics.retryScheduled('pending_reference');
       } catch (error) {
         // uma transação com problema não trava as outras do lote, ela continua vencida e volta no próximo ciclo
         result.failures.push({ transactionId, reason: error instanceof Error ? error.message : String(error) });
@@ -100,6 +102,8 @@ export class ResolvePendingReferences {
       // nova tentativa só atualiza a linha, o evento de pendente já saiu na primeira vez
       if (transaction.status === WagerTransactionStatus.PendingReference) return 'rescheduled';
 
+      // decisão final saindo pelo worker conta como canal próprio
+      this.metrics.transactionDecided('worker', transaction.kind, transaction.status);
       const trace = { correlationId: transaction.id, causationId: transaction.id };
       await scope.outbox.add(outboxMessagesFor(transaction, wallet, ledgerEntry, trace, this.ids, this.clock));
       // essa também pode ser referência de outra que estava esperando, tipo um ROLLBACK de REFUND

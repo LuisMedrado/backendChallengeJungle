@@ -1,12 +1,14 @@
-import { Body, Controller, Get, Headers, HttpCode, Inject, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, Inject, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import type { IdGenerator } from '../../application/ports';
 import { CreateWallet } from '../../application/use-cases/create-wallet';
 import { GetWallet, GetWalletLedger, ReconcileWallet } from '../../application/use-cases/queries';
 import { ID_GENERATOR } from '../../infrastructure/tokens';
+import { ProviderAuthGuard } from './provider-auth.guard';
 import { CreateWalletDto, LedgerQueryDto } from './dto';
 import { presentLedgerItem, presentReconciliation, presentWallet } from './presenters';
 import { traceFrom } from './request-context';
 
+@UseGuards(ProviderAuthGuard)
 @Controller('wallets')
 export class WalletsController {
   constructor(
